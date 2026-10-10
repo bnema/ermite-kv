@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 // Package faultfs is an in-memory fsys.FS for tests. It models a page cache in
-// front of durable storage and can inject write and sync failures, delay
-// syncs, count syncs and simulate a power loss.
+// front of durable storage and can inject failures in writes, syncs and
+// directory and file operations, delay syncs, count syncs and simulate a power
+// loss.
 //
 // Durability model: file bytes become durable on Sync or SyncAll; directory
 // operations (create, rename, remove, mkdir) become durable on SyncDir of the
@@ -35,6 +36,42 @@ var ErrInjected = errors.New("faultfs: injected failure")
 
 const defaultPageSize = 4096
 
+// OpKind identifies a file-system operation other than Write and Sync, whose
+// failures are injected with FailOp.
+type OpKind uint8
+
+// Operations that FailOp can fail.
+const (
+	OpSyncDir OpKind = iota
+	OpRename
+	OpRemove
+	OpTruncate
+	OpOpenFile
+	numOps
+)
+
+func (k OpKind) String() string {
+	switch k {
+	case OpSyncDir:
+		return "SyncDir"
+	case OpRename:
+		return "Rename"
+	case OpRemove:
+		return "Remove"
+	case OpTruncate:
+		return "Truncate"
+	case OpOpenFile:
+		return "OpenFile"
+	}
+	return "unknown"
+}
+
+// opCall designates the n-th call of an operation kind.
+type opCall struct {
+	kind OpKind
+	n    int
+}
+
 type node struct {
 	data      []byte // current content (page cache)
 	durable   []byte // content as of the last successful sync
@@ -64,6 +101,10 @@ type FS struct {
 	failSync                map[int]error      // by absolute sync number (Sync+SyncAll)
 	syncDelay               time.Duration
 	nSyncCalls              int
+	dropOnSyncFail          bool
+
+	opCalls [numOps]int      // calls so far, by kind
+	failOps map[opCall]error // by kind and absolute call number
 }
 
 type writeFault struct {
@@ -81,6 +122,7 @@ func New() *FS {
 		locks:     map[string]bool{},
 		failWrite: map[int]writeFault{},
 		failSync:  map[int]error{},
+		failOps:   map[opCall]error{},
 	}
 }
 
@@ -113,6 +155,49 @@ func (f *FS) FailSync(n int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failSync[f.nSyncCalls+n] = err
+}
+
+// FailOp makes the n-th call from now (1 = the next one) of the operation
+// kind fail with err (ErrInjected if nil). A failed call has no effect. Every
+// call counts, whether or not it would have failed anyway.
+func (f *FS) FailOp(kind OpKind, n int, err error) {
+	if err == nil {
+		err = ErrInjected
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOps[opCall{kind, f.opCalls[kind] + n}] = err
+}
+
+// OpCalls returns the number of calls of the operation kind so far.
+func (f *FS) OpCalls(kind OpKind) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.opCalls[kind]
+}
+
+// injected counts a call of kind and returns the error to fail it with, if
+// any. It must be called with f.mu held.
+func (f *FS) injected(kind OpKind) error {
+	f.opCalls[kind]++
+	c := opCall{kind, f.opCalls[kind]}
+	err, ok := f.failOps[c]
+	if ok {
+		delete(f.failOps, c)
+	}
+	return err
+}
+
+// DropOnSyncFailure selects what a failed Sync or SyncAll does to the data
+// that was not yet durable. By default it stays in the page cache and a later
+// successful sync makes it durable. When enabled, it is dropped, as on
+// systems that mark the pages clean after a write-back error ("fsyncgate"):
+// the file reverts to its last durable content, and the data is gone even if
+// a later sync succeeds.
+func (f *FS) DropOnSyncFailure(drop bool) {
+	f.mu.Lock()
+	f.dropOnSyncFail = drop
+	f.mu.Unlock()
 }
 
 // SetSyncDelay makes every Sync and SyncAll block for d before taking effect.
@@ -294,6 +379,9 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (fsys.File, error
 	name = filepath.Clean(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.injected(OpOpenFile); err != nil {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
+	}
 	n, ok := f.files[name]
 	switch {
 	case f.dirs[name]:
@@ -322,6 +410,9 @@ func (f *FS) Rename(oldpath, newpath string) error {
 	oldpath, newpath = filepath.Clean(oldpath), filepath.Clean(newpath)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.injected(OpRename); err != nil {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
+	}
 	n, ok := f.files[oldpath]
 	if !ok {
 		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: fs.ErrNotExist}
@@ -345,6 +436,9 @@ func (f *FS) Remove(name string) error {
 	name = filepath.Clean(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.injected(OpRemove); err != nil {
+		return &fs.PathError{Op: "remove", Path: name, Err: err}
+	}
 	n, ok := f.files[name]
 	if !ok {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
@@ -394,6 +488,9 @@ func (f *FS) SyncDir(dir string) error {
 	dir = filepath.Clean(dir)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.injected(OpSyncDir); err != nil {
+		return &fs.PathError{Op: "sync", Path: dir, Err: err}
+	}
 	if !f.dirs[dir] {
 		return &fs.PathError{Op: "sync", Path: dir, Err: fs.ErrNotExist}
 	}
@@ -540,6 +637,10 @@ func (h *file) sync(all bool) error {
 	}
 	if err, ok := f.failSync[f.nSyncCalls]; ok {
 		delete(f.failSync, f.nSyncCalls)
+		if f.dropOnSyncFail {
+			h.n.data = append([]byte(nil), h.n.durable...)
+			h.n.truncated = false
+		}
 		f.mu.Unlock()
 		return err
 	}
@@ -568,6 +669,9 @@ func (h *file) Truncate(size int64) error {
 	defer h.fs.mu.Unlock()
 	if err := h.check(); err != nil {
 		return err
+	}
+	if err := h.fs.injected(OpTruncate); err != nil {
+		return &fs.PathError{Op: "truncate", Err: err}
 	}
 	if !h.write || size < 0 {
 		return &fs.PathError{Op: "truncate", Err: fs.ErrInvalid}

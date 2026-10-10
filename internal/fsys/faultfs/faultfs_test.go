@@ -382,3 +382,108 @@ func TestConcurrentUse(t *testing.T) {
 		t.Fatalf("Syncs=%d Writes=%d", f.Syncs(), f.Writes())
 	}
 }
+
+func TestFailOp(t *testing.T) {
+	f := New()
+	f.WriteFile("/d/a", []byte("x"))
+	f.WriteFile("/d/b", nil)
+
+	f.FailOp(OpOpenFile, 2, nil)
+	h, err := f.OpenFile("/d/a", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.OpenFile("/d/a", os.O_RDWR, 0); !errors.Is(err, ErrInjected) {
+		t.Fatalf("OpenFile = %v", err)
+	}
+	if _, err := f.OpenFile("/d/a", os.O_RDWR, 0); err != nil {
+		t.Fatalf("faults fire once: %v", err)
+	}
+
+	boom := errors.New("boom")
+	f.FailOp(OpTruncate, 1, boom)
+	if err := h.Truncate(0); !errors.Is(err, boom) {
+		t.Fatalf("Truncate = %v", err)
+	}
+	if sz, _ := h.Size(); sz != 1 {
+		t.Fatalf("failed Truncate changed the file: size %d", sz)
+	}
+	if err := h.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+
+	f.FailOp(OpRename, 1, nil)
+	if err := f.Rename("/d/b", "/d/c"); !errors.Is(err, ErrInjected) {
+		t.Fatalf("Rename = %v", err)
+	}
+	if _, ok := f.ReadFile("/d/b"); !ok {
+		t.Fatal("failed Rename moved the file")
+	}
+	if err := f.Rename("/d/b", "/d/c"); err != nil {
+		t.Fatal(err)
+	}
+
+	f.FailOp(OpRemove, 1, nil)
+	if err := f.Remove("/d/c"); !errors.Is(err, ErrInjected) {
+		t.Fatalf("Remove = %v", err)
+	}
+	if _, ok := f.ReadFile("/d/c"); !ok {
+		t.Fatal("failed Remove deleted the file")
+	}
+
+	f.FailOp(OpSyncDir, 1, nil)
+	if err := f.SyncDir("/d"); !errors.Is(err, ErrInjected) {
+		t.Fatalf("SyncDir = %v", err)
+	}
+	if err := f.SyncDir("/d"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.OpCalls(OpSyncDir); got != 2 {
+		t.Fatalf("OpCalls(SyncDir) = %d", got)
+	}
+}
+
+func TestFailedSyncDirKeepsOpsVolatile(t *testing.T) {
+	f := New()
+	_ = f.MkdirAll("/d", 0o700)
+	_ = f.SyncDir("/d")
+	create(t, f, "/d/a")
+	f.FailOp(OpSyncDir, 1, nil)
+	if err := f.SyncDir("/d"); err == nil {
+		t.Fatal("SyncDir succeeded")
+	}
+	f.PowerLoss(PowerLossOptions{})
+	if _, ok := f.ReadFile("/d/a"); ok {
+		t.Fatal("create survived a failed SyncDir")
+	}
+}
+
+func TestDropOnSyncFailure(t *testing.T) {
+	for _, drop := range []bool{false, true} {
+		f := New()
+		f.DropOnSyncFailure(drop)
+		h := create(t, f, "/a")
+		write(t, h, "kept")
+		if err := h.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		write(t, h, "-lost?")
+		f.FailSync(1, nil)
+		if err := h.Sync(); !errors.Is(err, ErrInjected) {
+			t.Fatalf("Sync = %v", err)
+		}
+		want := "kept-lost?"
+		if drop {
+			want = "kept"
+		}
+		if got := mustRead(t, f, "/a"); got != want {
+			t.Fatalf("drop=%v: content %q, want %q", drop, got, want)
+		}
+		if err := h.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if d, _ := f.DurableFile("/a"); string(d) != want {
+			t.Fatalf("drop=%v: durable %q, want %q", drop, d, want)
+		}
+	}
+}
