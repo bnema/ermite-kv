@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -243,6 +245,11 @@ func TestTreeModel(t *testing.T) {
 						if got, ok := b.get(k); ok != (m[string(k)].Version != 0) || (ok && !equalItem(got, m[string(k)])) {
 							t.Fatalf("seed %d: builder.get mismatch", seed)
 						}
+						if rng.IntN(512) == 0 {
+							// Freeze mid-group and keep using the builder: the
+							// frozen tree must never see later builder writes.
+							history = append(history, frozen{b.freeze(), m.clone()})
+						}
 					}
 					if b.len() != len(m) {
 						t.Fatalf("seed %d: builder.len = %d, want %d", seed, b.len(), len(m))
@@ -443,4 +450,58 @@ func TestTreeDeep(t *testing.T) {
 		t.Fatalf("tree not empty: len=%d", tr.len())
 	}
 	checkStructure(t, full)
+}
+
+// TestConcurrentReaders reads published snapshots without locks while one
+// builder keeps writing and freezing, so -race sees any shared mutation.
+func TestConcurrentReaders(t *testing.T) {
+	var cur atomic.Pointer[Snapshot]
+	cur.Store(newSnapshot(tree{}, 0))
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				s := cur.Load()
+				n := 0
+				var prev []byte
+				for k, it := range s.Range(nil, nil) {
+					if prev != nil && bytes.Compare(prev, k) >= 0 {
+						t.Errorf("seq %d: keys out of order", s.Seq())
+						return
+					}
+					if it.Version > s.Seq() {
+						t.Errorf("seq %d: version %d from the future", s.Seq(), it.Version)
+						return
+					}
+					prev = k
+					n++
+				}
+				if n != s.Len() {
+					t.Errorf("seq %d: ranged %d keys, Len %d", s.Seq(), n, s.Len())
+					return
+				}
+			}
+		})
+	}
+	rng := rand.New(rand.NewPCG(1, 2))
+	b := cur.Load().t.builder()
+	for seq := uint64(1); seq <= 3000; seq++ {
+		for range 1 + rng.IntN(8) {
+			k := fmt.Appendf(nil, "k%04d", rng.IntN(2000))
+			if rng.IntN(3) == 0 {
+				b.delete(k)
+			} else {
+				b.put(k, []byte("v"), seq)
+			}
+		}
+		cur.Store(newSnapshot(b.freeze(), seq))
+	}
+	close(stop)
+	wg.Wait()
 }

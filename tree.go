@@ -276,17 +276,18 @@ func (b *builder) delete(key []byte) {
 	}
 }
 
-// remove deletes key (or, with max, the largest entry) from the subtree of the
-// owned node n and returns the removed entry. The key must exist. Every child
-// descended into is first guaranteed to hold more than minEntries entries.
-func (b *builder) remove(n *node, key []byte, max bool) entry {
+// remove deletes key (or, with rightmost, the largest entry) from the subtree
+// of the owned node n and returns the removed entry. The key must exist: a
+// missing key would delete an unrelated leaf entry. Every child descended into
+// is first guaranteed to hold more than minEntries entries.
+func (b *builder) remove(n *node, key []byte, rightmost bool) entry {
 	for {
 		var i int
 		var found bool
 		switch {
-		case max && n.leaf():
+		case rightmost && n.leaf():
 			i, found = len(n.entries)-1, true
-		case max:
+		case rightmost:
 			i = len(n.entries)
 		default:
 			i, found = n.find(key)
