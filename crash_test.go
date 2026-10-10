@@ -4,12 +4,14 @@ package kv
 
 import (
 	"bytes"
+	"errors"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -58,11 +60,13 @@ func TestCrashChild(t *testing.T) {
 	}
 }
 
-// ackReader records the highest seq the child reported.
+// ackReader records the highest seq the child reported and keeps every
+// other line (test failures are written to stdout).
 type ackReader struct {
-	mu   sync.Mutex
-	rest []byte
-	last int
+	mu    sync.Mutex
+	rest  []byte
+	last  int
+	other strings.Builder
 }
 
 func (a *ackReader) Write(p []byte) (int, error) {
@@ -76,9 +80,18 @@ func (a *ackReader) Write(p []byte) (int, error) {
 		}
 		if n, err := strconv.Atoi(string(line)); err == nil {
 			a.last = max(a.last, n)
+		} else {
+			a.other.Write(line)
+			a.other.WriteByte('\n')
 		}
 		a.rest = rest
 	}
+}
+
+func (a *ackReader) output() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.other.String()
 }
 
 func (a *ackReader) lastAcked() int {
@@ -120,7 +133,14 @@ func TestCrash(t *testing.T) {
 		delay := time.Duration(20+rng.IntN(180)) * time.Millisecond
 		time.Sleep(delay)
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait() // reports the kill; it also waits for the stdout copy
+		// Wait also waits for the stdout copy. The child must have died from
+		// the kill: an earlier exit means the writer itself failed.
+		werr := cmd.Wait()
+		var exitErr *exec.ExitError
+		if !errors.As(werr, &exitErr) || exitErr.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			t.Fatalf("iteration %d: child did not die from SIGKILL (%v)\nchild output: %s\nchild stderr: %s",
+				i, werr, acks.output(), stderr.String())
+		}
 		acked := acks.lastAcked()
 
 		db, err := Open(bg, dir, Options{})
