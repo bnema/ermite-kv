@@ -15,9 +15,11 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -175,8 +177,10 @@ func (f *FS) PowerLoss(o PowerLossOptions) {
 			delete(f.files, p)
 		}
 	}
+	// Crash files in path order so a seeded Rand gives reproducible results.
 	seen := map[*node]bool{}
-	for _, n := range f.files {
+	for _, p := range slices.Sorted(maps.Keys(f.files)) {
+		n := f.files[p]
 		if !seen[n] {
 			seen[n] = true
 			n.crash(o)
