@@ -72,8 +72,9 @@ func (db *DB) writer() {
 		if !db.commit() {
 			return
 		}
-		// P1.D hook: after replying, trigger compaction here once
-		// db.logSize exceeds db.opts.CompactAfter (if it is positive).
+		if !db.maybeCompact() {
+			return
+		}
 	}
 }
 

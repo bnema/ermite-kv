@@ -83,10 +83,14 @@ type DB struct {
 
 	lock io.Closer
 
+	compacting atomic.Bool    // a compactor goroutine is running
+	compactors sync.WaitGroup // started by the writer only; Close waits after the writer exits
+
 	// Owned by the writer goroutine (see writer.go).
 	file    fsys.File
 	logBase uint64 // seq the current log starts after
 	logSize int64  // bytes in the current log, header included
+	retryAt int64  // do not try a log switch again before logSize reaches this
 	buf     []byte // group encoding buffer
 	group   []*request
 }
@@ -167,8 +171,8 @@ func (db *DB) Close(ctx context.Context) error {
 	var err error
 	db.closeOnce.Do(func() {
 		close(db.closing)
-		<-db.done // the writer finishes its group and exits
-		// P1.D: wait here for an in-flight compaction.
+		<-db.done            // the writer finishes its group and exits
+		db.compactors.Wait() // an in-flight compaction is not cancelled
 		select {
 		case <-db.failed:
 			err = db.failErr
