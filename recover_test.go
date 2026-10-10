@@ -93,7 +93,7 @@ func snapshotBytes(t *testing.T, seq uint64, entries ...snapEntry) []byte {
 	return encodeSnapshot(t, seq, entries)
 }
 
-func entry(k, v string, ver uint64) snapEntry { return snapEntry{[]byte(k), []byte(v), ver} }
+func snapEnt(k, v string, ver uint64) snapEntry { return snapEntry{[]byte(k), []byte(v), ver} }
 
 func wantState(t *testing.T, s *state, m map[string]string) {
 	t.Helper()
@@ -373,11 +373,11 @@ func TestRecoverSeqGap(t *testing.T) {
 			put(fx, logName(4), logBytes(4, []op{putOp("a", "1")}))
 		},
 		"log after snapshot has a gap": func(fx *faultfs.FS) {
-			put(fx, snapshotName(3), snapshotBytes(t, 3, entry("a", "1", 3)))
+			put(fx, snapshotName(3), snapshotBytes(t, 3, snapEnt("a", "1", 3)))
 			put(fx, logName(5), logBytes(5, []op{putOp("b", "2")}))
 		},
 		"logs end before snapshot": func(fx *faultfs.FS) {
-			put(fx, snapshotName(5), snapshotBytes(t, 5, entry("a", "1", 3)))
+			put(fx, snapshotName(5), snapshotBytes(t, 5, snapEnt("a", "1", 3)))
 			put(fx, logName(0), logBytes(0, []op{putOp("a", "1")}))
 		},
 		"duplicate seq": func(fx *faultfs.FS) {
@@ -400,7 +400,7 @@ func TestRecoverSeqGap(t *testing.T) {
 
 func TestRecoverSnapshotThenLogs(t *testing.T) {
 	fx := faultfs.New()
-	put(fx, snapshotName(3), snapshotBytes(t, 3, entry("a", "1", 1), entry("b", "2", 3)))
+	put(fx, snapshotName(3), snapshotBytes(t, 3, snapEnt("a", "1", 1), snapEnt("b", "2", 3)))
 	// log-0 still holds records already in the snapshot; log-3 continues it.
 	put(fx, logName(0), logBytes(0, []op{putOp("a", "old")}, []op{putOp("x", "gone")}, []op{putOp("b", "2")}))
 	put(fx, logName(3), logBytes(3, []op{putOp("c", "3")}, []op{delOp("a")}))
@@ -419,7 +419,7 @@ func TestRecoverSnapshotThenLogs(t *testing.T) {
 
 func TestRecoverSnapshotWithoutLogCreatesLog(t *testing.T) {
 	fx := faultfs.New()
-	put(fx, snapshotName(7), snapshotBytes(t, 7, entry("a", "1", 7)))
+	put(fx, snapshotName(7), snapshotBytes(t, 7, snapEnt("a", "1", 7)))
 	s, rec := mustRecover(t, fx)
 	wantState(t, s, map[string]string{"a": "1"})
 	if rec.snapSeq != 7 || rec.lastSeq != 7 || rec.logBase != 7 || rec.logSize != logHeaderSize {
@@ -431,12 +431,12 @@ func TestRecoverSnapshotWithoutLogCreatesLog(t *testing.T) {
 }
 
 func TestRecoverInvalidNewestSnapshotFallsBack(t *testing.T) {
-	good := snapshotBytes(t, 2, entry("a", "1", 1), entry("b", "2", 2))
-	newer := snapshotBytes(t, 4, entry("a", "1", 1), entry("z", "9", 4))
+	good := snapshotBytes(t, 2, snapEnt("a", "1", 1), snapEnt("b", "2", 2))
+	newer := snapshotBytes(t, 4, snapEnt("a", "1", 1), snapEnt("z", "9", 4))
 	truncated := newer[:len(newer)-2]
 	flipped := append([]byte(nil), newer...)
 	flipped[30] ^= 1
-	wrongName := snapshotBytes(t, 3, entry("a", "1", 1))
+	wrongName := snapshotBytes(t, 3, snapEnt("a", "1", 1))
 	for name, bad := range map[string][]byte{"truncated": truncated, "flipped": flipped, "empty": nil, "seq/name mismatch": wrongName} {
 		t.Run(name, func(t *testing.T) {
 			fx := faultfs.New()
@@ -486,7 +486,7 @@ func TestRecoverNoSnapshotStartsAtZero(t *testing.T) {
 
 func TestRecoverSnapshotLoadOrderAndOwnership(t *testing.T) {
 	fx := faultfs.New()
-	put(fx, snapshotName(1), snapshotBytes(t, 1, entry("a", "1", 1), entry("b", "2", 1), entry("c", "3", 1)))
+	put(fx, snapshotName(1), snapshotBytes(t, 1, snapEnt("a", "1", 1), snapEnt("b", "2", 1), snapEnt("c", "3", 1)))
 	var keys []string
 	var held [][]byte
 	_, err := recoverDir(fx, testDir, nil, func(k, v []byte, ver uint64) {
