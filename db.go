@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: MIT
+
+package kv
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"bnema.dev/ermite-kv/internal/fsys"
+)
+
+// Defaults for zero Options fields.
+const (
+	defaultMaxBatchBytes = 16 << 20
+	defaultCompactAfter  = 64 << 20
+)
+
+// Options configures Open. The zero value of every field means "default";
+// Options{} is safe and durable.
+type Options struct {
+	// NoSync skips fdatasync on commits. For tests and benchmarks only: an
+	// acknowledged batch may be lost on power failure.
+	NoSync bool
+	// MaxBatchBytes is the encoded batch limit. 0 means 16 MiB; it must be
+	// at most 64 MiB (the format limit).
+	MaxBatchBytes int
+	// CompactAfter is the number of bytes in the current log that trigger
+	// compaction. 0 means 64 MiB; a negative value disables compaction.
+	CompactAfter int64
+	// GroupWindow is the extra time the writer waits to grow a commit
+	// group. 0 means it only drains what is already queued.
+	GroupWindow time.Duration
+	// Logger receives warnings and errors. nil discards them.
+	Logger *slog.Logger
+}
+
+// resolve validates o and fills in the defaults.
+func (o Options) resolve() (Options, error) {
+	switch {
+	case o.MaxBatchBytes < 0 || o.MaxBatchBytes > maxRecord:
+		return o, fmt.Errorf("kv: invalid MaxBatchBytes %d: must be in [0, %d]", o.MaxBatchBytes, maxRecord)
+	case o.GroupWindow < 0:
+		return o, fmt.Errorf("kv: invalid GroupWindow %v: must not be negative", o.GroupWindow)
+	}
+	if o.MaxBatchBytes == 0 {
+		o.MaxBatchBytes = defaultMaxBatchBytes
+	}
+	if o.CompactAfter == 0 {
+		o.CompactAfter = defaultCompactAfter
+	}
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.DiscardHandler)
+	}
+	return o, nil
+}
+
+// DB is an embedded, durable, ordered key-value store. All methods are safe
+// for concurrent use.
+type DB struct {
+	fx   fsys.FS
+	opts Options
+	snap atomic.Pointer[Snapshot] // last published state
+
+	reqCh   chan *request // never closed
+	closing chan struct{} // closed by Close
+	done    chan struct{} // closed when the writer has exited
+
+	failed   chan struct{} // closed when the database enters the failed state
+	failOnce sync.Once
+	failErr  error // first cause, wrapping ErrFailed; set before failed is closed
+
+	closeOnce sync.Once
+	closeErr  error
+
+	lock io.Closer
+
+	// Owned by the writer goroutine (see writer.go).
+	log     fsys.File
+	logBase uint64 // seq the current log starts after
+	logSize int64  // bytes in the current log, header included
+	buf     []byte // group encoding buffer
+	group   []*request
+}
+
+// Open opens the database in dir, creating it (mode 0700) if needed. It
+// takes an exclusive lock on the directory, returning ErrLocked if another
+// DB holds it, and recovers the state from the snapshot and logs. Invalid
+// options are an error.
+func Open(dir string, opts Options) (*DB, error) {
+	return open(fsys.OS(), dir, opts)
+}
+
+func open(fx fsys.FS, dir string, opts Options) (*DB, error) {
+	opts, err := opts.resolve()
+	if err != nil {
+		return nil, err
+	}
+	bld := tree{}.builder()
+	rec, err := recoverDir(fx, dir, opts.Logger,
+		func(key, value []byte, version uint64) {
+			// Snapshot entries alias one shared file buffer: copy them so
+			// the tree does not keep the whole buffer alive.
+			buf := make([]byte, len(key)+len(value))
+			n := copy(buf, key)
+			copy(buf[n:], value)
+			bld.put(buf[:n:n], buf[n:len(buf):len(buf)], version)
+		},
+		func(seq uint64, ops []op) {
+			for _, o := range ops {
+				if o.kind == opPut {
+					bld.put(o.key, o.value, seq)
+				} else {
+					bld.delete(o.key)
+				}
+			}
+		})
+	if err != nil {
+		return nil, err
+	}
+	db := &DB{
+		fx:      fx,
+		opts:    opts,
+		reqCh:   make(chan *request),
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
+		failed:  make(chan struct{}),
+		lock:    rec.lock,
+		log:     rec.log,
+		logBase: rec.logBase,
+		logSize: rec.logSize,
+	}
+	db.snap.Store(newSnapshot(bld.freeze(), rec.lastSeq))
+	go db.writer()
+	return db, nil
+}
+
+// Close stops the database: requests not yet taken by the writer get
+// ErrClosed, the group in progress is committed and acknowledged, then the
+// log is closed and the directory lock released. Snapshots stay readable.
+//
+// Close returns the first error met while stopping, including the cause of
+// the failed state if the database failed, or nil. It is idempotent: later
+// calls return nil.
+func (db *DB) Close() error {
+	var err error
+	db.closeOnce.Do(func() {
+		close(db.closing)
+		<-db.done // the writer finishes its group and exits
+		// P1.D: wait here for an in-flight compaction.
+		select {
+		case <-db.failed:
+			err = db.failErr
+		default:
+		}
+		if cerr := db.log.Close(); err == nil {
+			err = cerr
+		}
+		if cerr := db.lock.Close(); err == nil {
+			err = cerr
+		}
+	})
+	return err
+}
+
+// Snapshot returns the current immutable state. It is lock-free and O(1), and
+// remains usable after Close.
+func (db *DB) Snapshot() *Snapshot { return db.snap.Load() }
+
+// Get returns the item stored under key in the current snapshot.
+func (db *DB) Get(key []byte) (Item, bool) { return db.snap.Load().Get(key) }
+
+// Apply commits b atomically and returns its seq once it is durable (unless
+// Options.NoSync) and visible in Snapshot.
+//
+// It returns the first error recorded by the batch (ErrInvalidKey), then
+// ErrBatchTooLarge if the encoded batch exceeds Options.MaxBatchBytes, both
+// without touching the database. ErrConflict (seq 0) means a precondition did
+// not hold at commit time. A batch without puts and deletes writes nothing,
+// consumes no seq and returns the current seq.
+//
+// If ctx ends before the writer takes the batch, Apply returns ctx.Err() and
+// the batch is not applied. Once the writer has taken it, ctx is ignored and
+// Apply waits for the outcome. ErrClosed is returned after Close. ErrFailed
+// (wrapping the I/O error) means the database failed: for the batch that was
+// being committed its outcome is unknown, since its bytes may be on disk and
+// replayed by the next Open.
+func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	if b.payload() > db.opts.MaxBatchBytes {
+		return 0, ErrBatchTooLarge
+	}
+	select {
+	case <-db.closing:
+		return 0, ErrClosed
+	case <-db.failed:
+		return 0, db.failErr
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	r := requestPool.Get().(*request)
+	r.b = b
+	select {
+	case db.reqCh <- r:
+	case <-ctx.Done():
+		return 0, r.release(ctx.Err())
+	case <-db.closing:
+		return 0, r.release(ErrClosed)
+	case <-db.failed:
+		return 0, r.release(db.failErr)
+	}
+	res := <-r.reply // the writer always answers a request it has taken
+	r.release(nil)
+	return res.seq, res.err
+}
