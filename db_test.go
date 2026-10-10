@@ -351,30 +351,57 @@ func TestPreconditionsBeforeOps(t *testing.T) {
 	mustMissing(t, db.Snapshot(bg), "other")
 }
 
+// holdWriter applies a batch whose sync is slow and returns once the writer
+// is inside that sync, so batches applied next queue up and form one group
+// (GroupWindow 0 drains everything already queued). wait returns when the
+// held batch is acknowledged; the sync delay stays set until then.
+func holdWriter(t *testing.T, db *DB, fx *faultfs.FS) (wait func()) {
+	t.Helper()
+	base := fx.Syncs()
+	fx.SetSyncDelay(300 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		var b Batch
+		b.Put([]byte("hold"), nil)
+		_, err := db.Apply(bg, &b)
+		done <- err
+	}()
+	for fx.Syncs() == base {
+		time.Sleep(time.Millisecond)
+	}
+	return func() {
+		t.Helper()
+		if err := <-done; err != nil {
+			t.Fatalf("held Apply: %v", err)
+		}
+		fx.SetSyncDelay(0)
+	}
+}
+
 // TestGroupPreconditions checks that preconditions see earlier batches of
-// the same group: with a group window, the second batch must conflict.
+// the same group: the second batch of the group must conflict.
 func TestGroupPreconditions(t *testing.T) {
 	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{GroupWindow: 200 * time.Millisecond})
+	db := mustOpen(t, fx, Options{})
 	syncs := fx.Syncs()
+	wait := holdWriter(t, db, fx)
 	errs := make([]error, 2)
 	var wg sync.WaitGroup
 	for i := range errs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var b Batch
 			b.RequireAbsent([]byte("k"))
 			b.Put([]byte("k"), []byte{byte('a' + i)})
 			_, errs[i] = db.Apply(bg, &b)
-		}()
+		})
 	}
 	wg.Wait()
+	wait()
 	if (errs[0] == nil) == (errs[1] == nil) {
 		t.Fatalf("errors %v, want exactly one success", errs)
 	}
-	if fx.Syncs() != syncs+1 {
-		t.Fatalf("%d syncs for the group, want 1", fx.Syncs()-syncs)
+	if got := fx.Syncs() - syncs; got != 2 {
+		t.Fatalf("%d syncs, want 2 (held batch, then one group)", got)
 	}
 }
 
@@ -672,7 +699,7 @@ func TestContextBeforeDequeue(t *testing.T) {
 		_, err := db.Apply(ctx, &b)
 		second <- err
 	}()
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // let Apply reach its blocking select
 	cancel()
 	if err := <-second; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Apply = %v, want context.Canceled", err)
@@ -787,11 +814,11 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 	fx := faultfs.New()
 	var logs syncBuffer
 	ctx := zerowrap.WithCtx(bg, zerowrap.New(zerowrap.Config{Level: "debug", Format: "json", Output: &logs}))
-	db := mustOpenCtx(t, ctx, fx, Options{GroupWindow: 150 * time.Millisecond})
-	putKV(t, db, "before", "1")
+	db := mustOpenCtx(t, ctx, fx, Options{})
+	wait := holdWriter(t, db, fx) // seq 1: "hold"; its write and sync have started
 	f.inject(fx)
 
-	// Three batches form the failed group (the window gathers them).
+	// Three batches queue behind the held one and form the failed group.
 	const group = 3
 	errs := make([]error, group)
 	var wg sync.WaitGroup
@@ -803,6 +830,7 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 		})
 	}
 	wg.Wait()
+	wait()
 	for i, err := range errs {
 		if !errors.Is(err, ErrFailed) {
 			t.Fatalf("batch %d: %v, want ErrFailed", i, err)
@@ -831,7 +859,7 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 	if s.Seq() != 1 || s.Len() != 1 {
 		t.Fatalf("snapshot after failure: seq %d len %d", s.Seq(), s.Len())
 	}
-	mustGet(t, s, "before", "1")
+	mustGet(t, s, "hold", "")
 	mustMissing(t, s, "failed0")
 	if err := db.Close(bg); !errors.Is(err, ErrFailed) {
 		t.Fatalf("Close = %v, want the failure", err)
@@ -844,7 +872,7 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 		fx.PowerLoss(faultfs.PowerLossOptions{})
 	}
 	s = mustOpen(t, fx, Options{}).Snapshot(bg)
-	mustGet(t, s, "before", "1")
+	mustGet(t, s, "hold", "")
 	present := 0
 	for i := range group {
 		if _, ok := s.Get(bg, fmt.Appendf(nil, "failed%d", i)); ok {
@@ -904,7 +932,8 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// powerLossBase returns the first seed; ERMITE_KV_SEED reproduces a run.
+// powerLossBase returns the first seed. ERMITE_KV_SEED replays the same
+// parameters; goroutine scheduling still varies between runs.
 func powerLossBase(t *testing.T) uint64 {
 	if v := os.Getenv("ERMITE_KV_SEED"); v != "" {
 		seed, err := strconv.ParseUint(v, 10, 64)
@@ -946,7 +975,7 @@ func TestPowerLoss(t *testing.T) {
 			for i := range iterations {
 				seed := base + uint64(i)
 				if !runPowerLoss(t, seed, m.opts) {
-					t.Fatalf("failed with seed %d (ERMITE_KV_SEED=%d reproduces it)", seed, seed)
+					t.Fatalf("failed with seed %d (ERMITE_KV_SEED=%d replays its parameters)", seed, seed)
 				}
 			}
 		})

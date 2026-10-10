@@ -217,12 +217,8 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 	if b.encodedSize() > db.opts.MaxBatchBytes {
 		return 0, ErrBatchTooLarge
 	}
-	select {
-	case <-db.closing:
-		return 0, ErrClosed
-	case <-db.failed:
-		return 0, db.failErr
-	default:
+	if err := db.stopped(); err != nil {
+		return 0, err
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -235,11 +231,27 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 	case <-ctx.Done():
 		return 0, r.release(ctx.Err())
 	case <-db.closing:
-		return 0, r.release(ErrClosed)
+		return 0, r.release(db.stopped())
 	case <-db.failed:
-		return 0, r.release(db.failErr)
+		return 0, r.release(db.stopped())
 	}
 	res := <-r.reply // the writer always answers a request it has taken
 	_ = r.release(nil)
 	return res.seq, res.err
+}
+
+// stopped returns the failure (which wins over Close, so callers see a
+// stable error), ErrClosed, or nil while the database accepts batches.
+func (db *DB) stopped() error {
+	select {
+	case <-db.failed:
+		return db.failErr
+	default:
+	}
+	select {
+	case <-db.closing:
+		return ErrClosed
+	default:
+		return nil
+	}
 }

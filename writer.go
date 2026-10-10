@@ -45,11 +45,9 @@ func (db *DB) writer() {
 	defer func() {
 		// A request taken but never grouped must still be answered.
 		if pending != nil {
-			err := ErrClosed
-			select {
-			case <-db.failed:
-				err = db.failErr
-			default:
+			err := db.stopped()
+			if err == nil {
+				err = ErrClosed // not reachable: the writer only exits on close or failure
 			}
 			pending.reply <- result{err: err}
 		}
