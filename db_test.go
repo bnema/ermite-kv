@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -19,20 +18,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bnema/zerowrap"
+
 	"bnema.dev/ermite-kv/internal/fsys"
 	"bnema.dev/ermite-kv/internal/fsys/faultfs"
 )
 
 var bg = context.Background()
 
+// testCtx returns a context carrying a console logger when
+// ERMITE_KV_LOG_LEVEL is set (the library itself never reads the
+// environment), and context.Background() (logging disabled) otherwise.
+func testCtx(t testing.TB) context.Context {
+	level := os.Getenv("ERMITE_KV_LOG_LEVEL")
+	if level == "" {
+		return bg
+	}
+	return zerowrap.WithCtx(bg, zerowrap.New(zerowrap.Config{Level: level, Format: "console", Output: t.Output()}))
+}
+
 // mustOpen opens a database on fx and closes it when the test ends.
 func mustOpen(t testing.TB, fx fsys.FS, opts Options) *DB {
 	t.Helper()
-	db, err := open(fx, testDir, opts)
+	return mustOpenCtx(t, testCtx(t), fx, opts)
+}
+
+func mustOpenCtx(t testing.TB, ctx context.Context, fx fsys.FS, opts Options) *DB {
+	t.Helper()
+	db, err := open(ctx, fx, testDir, opts)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = db.Close(bg) })
 	return db
 }
 
@@ -50,7 +67,7 @@ func putKV(t testing.TB, db *DB, key, value string) uint64 {
 
 func mustGet(t testing.TB, s *Snapshot, key, want string) Item {
 	t.Helper()
-	it, ok := s.Get([]byte(key))
+	it, ok := s.Get(bg, []byte(key))
 	if !ok || string(it.Value) != want {
 		t.Fatalf("Get(%q) = %q, %v; want %q", key, it.Value, ok, want)
 	}
@@ -59,7 +76,7 @@ func mustGet(t testing.TB, s *Snapshot, key, want string) Item {
 
 func mustMissing(t testing.TB, s *Snapshot, key string) {
 	t.Helper()
-	if it, ok := s.Get([]byte(key)); ok {
+	if it, ok := s.Get(bg, []byte(key)); ok {
 		t.Fatalf("Get(%q) = %q, want missing", key, it.Value)
 	}
 }
@@ -74,7 +91,7 @@ func short(full, quick int) int {
 func TestReopenFaultfs(t *testing.T) {
 	fx := faultfs.New()
 	db := mustOpen(t, fx, Options{})
-	if s := db.Snapshot(); s.Seq() != 0 || s.Len() != 0 {
+	if s := db.Snapshot(bg); s.Seq() != 0 || s.Len() != 0 {
 		t.Fatalf("new db: seq %d len %d", s.Seq(), s.Len())
 	}
 	for i := range 50 {
@@ -89,15 +106,15 @@ func TestReopenFaultfs(t *testing.T) {
 	if seq, err := db.Apply(bg, &b); err != nil || seq != 51 {
 		t.Fatalf("Apply = %d, %v", seq, err)
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 
 	db = mustOpen(t, fx, Options{})
-	s := db.Snapshot()
+	s := db.Snapshot(bg)
 	if s.Seq() != 51 || s.Len() != 49 {
 		t.Fatalf("reopened: seq %d len %d, want 51 and 49", s.Seq(), s.Len())
 	}
@@ -115,36 +132,36 @@ func TestReopenFaultfs(t *testing.T) {
 
 func TestReopenOS(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sub", "db")
-	db, err := Open(dir, Options{})
+	db, err := Open(testCtx(t), dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := range 100 {
 		putKV(t, db, fmt.Sprintf("k%03d", i), strings.Repeat("v", i))
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
 	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("dir stat: %v, %v", fi, err)
 	}
 
-	db, err = Open(dir, Options{})
+	db, err = Open(testCtx(t), dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	s := db.Snapshot()
+	defer func() { _ = db.Close(bg) }()
+	s := db.Snapshot(bg)
 	if s.Seq() != 100 || s.Len() != 100 {
 		t.Fatalf("seq %d len %d, want 100", s.Seq(), s.Len())
 	}
 	for i := range 100 {
 		mustGet(t, s, fmt.Sprintf("k%03d", i), strings.Repeat("v", i))
 	}
-	if got := db.Snapshot(); got != s {
+	if got := db.Snapshot(bg); got != s {
 		t.Fatal("Snapshot changed without a write")
 	}
-	if it, ok := db.Get([]byte("k005")); !ok || it.Version != 6 {
+	if it, ok := db.Get(bg, []byte("k005")); !ok || it.Version != 6 {
 		t.Fatalf("DB.Get = %v, %v", it, ok)
 	}
 }
@@ -163,7 +180,7 @@ func TestOpenFromSnapshot(t *testing.T) {
 	fx.WriteFile(filepath.Join(testDir, snapshotName(9)), buf.Bytes())
 
 	db := mustOpen(t, fx, Options{})
-	s := db.Snapshot()
+	s := db.Snapshot(bg)
 	if s.Seq() != 9 || s.Len() != 3 {
 		t.Fatalf("seq %d len %d", s.Seq(), s.Len())
 	}
@@ -173,14 +190,14 @@ func TestOpenFromSnapshot(t *testing.T) {
 	if seq := putKV(t, db, "d", "4"); seq != 10 {
 		t.Fatalf("seq = %d, want 10", seq)
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
 	db = mustOpen(t, fx, Options{})
-	mustGet(t, db.Snapshot(), "d", "4")
-	mustGet(t, db.Snapshot(), "c", "3")
-	if db.Snapshot().Seq() != 10 {
-		t.Fatalf("seq = %d", db.Snapshot().Seq())
+	mustGet(t, db.Snapshot(bg), "d", "4")
+	mustGet(t, db.Snapshot(bg), "c", "3")
+	if db.Snapshot(bg).Seq() != 10 {
+		t.Fatalf("seq = %d", db.Snapshot(bg).Seq())
 	}
 }
 
@@ -205,7 +222,7 @@ func TestConcurrentWriters(t *testing.T) {
 					t.Errorf("writer %d: %v", g, err)
 					return
 				}
-				if it, ok := db.Get([]byte(key)); !ok || it.Version < seq {
+				if it, ok := db.Get(bg, []byte(key)); !ok || it.Version < seq {
 					t.Errorf("writer %d: no read-your-writes for %s at seq %d", g, key, seq)
 					return
 				}
@@ -228,10 +245,10 @@ func TestConcurrentWriters(t *testing.T) {
 			t.Fatalf("seq %d at rank %d: seqs are not 1..%d", s, i, len(all))
 		}
 	}
-	if got := db.Snapshot().Seq(); got != writers*uint64(per) {
+	if got := db.Snapshot(bg).Seq(); got != writers*uint64(per) {
 		t.Fatalf("Seq = %d, want %d", got, writers*per)
 	}
-	if got := db.Snapshot().Len(); got != writers*per {
+	if got := db.Snapshot(bg).Len(); got != writers*per {
 		t.Fatalf("Len = %d, want %d", got, writers*per)
 	}
 }
@@ -271,9 +288,9 @@ func TestRequireAbsentRace(t *testing.T) {
 				t.Fatalf("%d winners, want 1", wins.Load())
 			}
 			w := slices.Index(winner, true)
-			mustGet(t, db.Snapshot(), "lock", strconv.Itoa(w))
-			if db.Snapshot().Seq() != 1 {
-				t.Fatalf("Seq = %d, want 1 (conflicts consume no seq)", db.Snapshot().Seq())
+			mustGet(t, db.Snapshot(bg), "lock", strconv.Itoa(w))
+			if db.Snapshot(bg).Seq() != 1 {
+				t.Fatalf("Seq = %d, want 1 (conflicts consume no seq)", db.Snapshot(bg).Seq())
 			}
 		})
 	}
@@ -298,9 +315,9 @@ func TestRequireVersion(t *testing.T) {
 	if seq, err := cas("missing", 1, "c"); !errors.Is(err, ErrConflict) || seq != 0 {
 		t.Fatalf("cas on missing key: %d, %v", seq, err)
 	}
-	mustGet(t, db.Snapshot(), "k", "b")
-	mustMissing(t, db.Snapshot(), "missing")
-	if got := db.Snapshot().Seq(); got != v2 {
+	mustGet(t, db.Snapshot(bg), "k", "b")
+	mustMissing(t, db.Snapshot(bg), "missing")
+	if got := db.Snapshot(bg).Seq(); got != v2 {
 		t.Fatalf("Seq = %d, want %d", got, v2)
 	}
 }
@@ -323,15 +340,15 @@ func TestPreconditionsBeforeOps(t *testing.T) {
 	b.Put([]byte("other"), []byte("x"))
 	b.RequireAbsent([]byte("never"))
 	b.RequireAbsent([]byte("exists")) // fails
-	before := db.Snapshot()
+	before := db.Snapshot(bg)
 	if seq, err := db.Apply(bg, &b); !errors.Is(err, ErrConflict) || seq != 0 {
 		t.Fatalf("Apply = %d, %v; want ErrConflict", seq, err)
 	}
-	if db.Snapshot() != before {
+	if db.Snapshot(bg) != before {
 		t.Fatal("a conflicting batch published a snapshot")
 	}
-	mustGet(t, db.Snapshot(), "exists", "1")
-	mustMissing(t, db.Snapshot(), "other")
+	mustGet(t, db.Snapshot(bg), "exists", "1")
+	mustMissing(t, db.Snapshot(bg), "other")
 }
 
 // TestGroupPreconditions checks that preconditions see earlier batches of
@@ -367,7 +384,7 @@ func TestEmptyAndConflictOnlyBatches(t *testing.T) {
 	putKV(t, db, "a", "1")
 	putKV(t, db, "b", "2")
 	writes, syncs := fx.Writes(), fx.Syncs()
-	snap := db.Snapshot()
+	snap := db.Snapshot(bg)
 
 	var empty Batch
 	if seq, err := db.Apply(bg, &empty); err != nil || seq != 2 {
@@ -403,15 +420,15 @@ func TestEmptyAndConflictOnlyBatches(t *testing.T) {
 	if got := fx.Syncs() - syncs; got != 1 {
 		t.Fatalf("%d syncs, want 1", got)
 	}
-	if db.Snapshot().Len() != snap.Len() || db.Snapshot().Seq() != 3 {
-		t.Fatalf("snapshot after: seq %d len %d", db.Snapshot().Seq(), db.Snapshot().Len())
+	if db.Snapshot(bg).Len() != snap.Len() || db.Snapshot(bg).Seq() != 3 {
+		t.Fatalf("snapshot after: seq %d len %d", db.Snapshot(bg).Seq(), db.Snapshot(bg).Len())
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
 	db = mustOpen(t, fx, Options{})
-	if db.Snapshot().Seq() != 3 || db.Snapshot().Len() != 2 {
-		t.Fatalf("reopened: seq %d len %d", db.Snapshot().Seq(), db.Snapshot().Len())
+	if db.Snapshot(bg).Seq() != 3 || db.Snapshot(bg).Len() != 2 {
+		t.Fatalf("reopened: seq %d len %d", db.Snapshot(bg).Seq(), db.Snapshot(bg).Len())
 	}
 }
 
@@ -461,7 +478,7 @@ func TestGroupCommitSyncs(t *testing.T) {
 	if syncs >= total/4 {
 		t.Fatalf("%d syncs for %d batches: no group commit", syncs, total)
 	}
-	if got := db.Snapshot().Len(); got != total {
+	if got := db.Snapshot(bg).Len(); got != total {
 		t.Fatalf("Len = %d, want %d", got, total)
 	}
 }
@@ -474,10 +491,10 @@ func TestNoSync(t *testing.T) {
 	if fx.Syncs() != base {
 		t.Fatal("NoSync still syncs")
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
-	mustGet(t, mustOpen(t, fx, Options{}).Snapshot(), "a", "1")
+	mustGet(t, mustOpen(t, fx, Options{}).Snapshot(bg), "a", "1")
 }
 
 // TestLargeBatches covers a batch above the 4 MiB group cap (a group of one)
@@ -502,10 +519,10 @@ func TestLargeBatches(t *testing.T) {
 			t.Fatalf("seqs = %v", seqs)
 		}
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
-	s := mustOpen(t, fx, Options{}).Snapshot()
+	s := mustOpen(t, fx, Options{}).Snapshot(bg)
 	mustGet(t, s, "big", big)
 	for i := range n {
 		mustGet(t, s, fmt.Sprintf("chunk%d", i), chunk)
@@ -532,48 +549,49 @@ func TestInvalidInputs(t *testing.T) {
 		t.Fatalf("version 0: %v", err)
 	}
 
-	// Payload = 12 (seq, count) + 1 (kind) + 1 (klen) + 1 (key) + 1 (vlen) + v.
+	// Encoded batch = 4 (count) + 1 (kind) + 1 (klen) + 1 (key) + 1 (vlen) + v.
 	b.Reset()
-	b.Put([]byte("k"), make([]byte, 85))
+	b.Put([]byte("k"), make([]byte, 93))
 	if seq, err := db.Apply(bg, &b); !errors.Is(err, ErrBatchTooLarge) || seq != 0 {
-		t.Fatalf("101-byte payload: %d, %v", seq, err)
+		t.Fatalf("101-byte batch: %d, %v", seq, err)
 	}
 	b.Reset()
-	b.Put([]byte("k"), make([]byte, 84))
+	b.Put([]byte("k"), make([]byte, 92))
 	if _, err := db.Apply(bg, &b); err != nil {
-		t.Fatalf("100-byte payload: %v", err)
+		t.Fatalf("100-byte batch: %v", err)
 	}
-	if db.Snapshot().Seq() != 1 {
-		t.Fatalf("Seq = %d: rejected batches reached the log", db.Snapshot().Seq())
+	if db.Snapshot(bg).Seq() != 1 {
+		t.Fatalf("Seq = %d: rejected batches reached the log", db.Snapshot(bg).Seq())
 	}
 }
 
 func TestOptionValidation(t *testing.T) {
 	bad := []Options{
 		{MaxBatchBytes: maxRecord + 1},
+		{MaxBatchBytes: maxRecord - 11},
 		{MaxBatchBytes: -1},
 		{GroupWindow: -time.Second},
 	}
 	for _, o := range bad {
 		fx := faultfs.New()
-		if db, err := open(fx, testDir, o); err == nil {
-			_ = db.Close()
+		if db, err := open(testCtx(t), fx, testDir, o); err == nil {
+			_ = db.Close(bg)
 			t.Errorf("open(%+v) succeeded", o)
 		}
 		if _, err := fx.ReadDir(testDir); err == nil {
 			t.Errorf("open(%+v) created the directory", o)
 		}
 	}
-	if _, err := Open(t.TempDir(), Options{MaxBatchBytes: 65 << 20}); err == nil {
+	if _, err := Open(testCtx(t), t.TempDir(), Options{MaxBatchBytes: 65 << 20}); err == nil {
 		t.Error("Open with MaxBatchBytes > 64 MiB succeeded")
 	}
-	for _, o := range []Options{{MaxBatchBytes: maxRecord}, {CompactAfter: -1}, {NoSync: true, CompactAfter: 1}} {
-		db, err := open(faultfs.New(), testDir, o)
+	for _, o := range []Options{{MaxBatchBytes: maxRecord - 12}, {CompactAfter: -1}, {NoSync: true, CompactAfter: 1}} {
+		db, err := open(testCtx(t), faultfs.New(), testDir, o)
 		if err != nil {
 			t.Errorf("open(%+v): %v", o, err)
 			continue
 		}
-		_ = db.Close()
+		_ = db.Close(bg)
 	}
 }
 
@@ -581,39 +599,39 @@ func TestLocked(t *testing.T) {
 	t.Run("faultfs", func(t *testing.T) {
 		fx := faultfs.New()
 		db := mustOpen(t, fx, Options{})
-		if _, err := open(fx, testDir, Options{}); !errors.Is(err, ErrLocked) {
+		if _, err := open(testCtx(t), fx, testDir, Options{}); !errors.Is(err, ErrLocked) {
 			t.Fatalf("second open: %v, want ErrLocked", err)
 		}
-		if err := db.Close(); err != nil {
+		if err := db.Close(bg); err != nil {
 			t.Fatal(err)
 		}
 		mustOpen(t, fx, Options{})
 	})
 	t.Run("os", func(t *testing.T) {
 		dir := t.TempDir()
-		db, err := Open(dir, Options{})
+		db, err := Open(testCtx(t), dir, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Open(dir, Options{}); !errors.Is(err, ErrLocked) {
+		if _, err := Open(testCtx(t), dir, Options{}); !errors.Is(err, ErrLocked) {
 			t.Fatalf("second Open: %v, want ErrLocked", err)
 		}
 		putKV(t, db, "still", "works")
-		if err := db.Close(); err != nil {
+		if err := db.Close(bg); err != nil {
 			t.Fatal(err)
 		}
-		db, err = Open(dir, Options{})
+		db, err = Open(testCtx(t), dir, Options{})
 		if err != nil {
 			t.Fatalf("Open after Close: %v", err)
 		}
-		db.Close()
+		_ = db.Close(bg)
 	})
 }
 
 func TestApplyAfterClose(t *testing.T) {
 	db := mustOpen(t, faultfs.New(), Options{})
 	putKV(t, db, "a", "1")
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
 	var b Batch
@@ -621,8 +639,8 @@ func TestApplyAfterClose(t *testing.T) {
 	if _, err := db.Apply(bg, &b); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Apply after Close: %v", err)
 	}
-	mustGet(t, db.Snapshot(), "a", "1") // reads keep working
-	if err := db.Close(); err != nil {
+	mustGet(t, db.Snapshot(bg), "a", "1") // reads keep working
+	if err := db.Close(bg); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 }
@@ -671,10 +689,10 @@ func TestContextBeforeDequeue(t *testing.T) {
 		t.Fatalf("Apply with cancelled ctx = %v", err)
 	}
 	putKV(t, db, "fourth", "4") // the writer is still healthy
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
-	s := mustOpen(t, fx, Options{}).Snapshot()
+	s := mustOpen(t, fx, Options{}).Snapshot(bg)
 	mustGet(t, s, "first", "1")
 	mustGet(t, s, "fourth", "4")
 	mustMissing(t, s, "second")
@@ -712,7 +730,7 @@ func TestCloseDuringApplies(t *testing.T) {
 			}
 			time.Sleep(time.Duration(2+i) * time.Millisecond)
 			closed := make(chan error, 1)
-			go func() { closed <- db.Close() }()
+			go func() { closed <- db.Close(bg) }()
 			select {
 			case err := <-closed:
 				if err != nil {
@@ -724,12 +742,12 @@ func TestCloseDuringApplies(t *testing.T) {
 			wg.Wait()
 
 			fx.SetSyncDelay(0)
-			s := mustOpen(t, fx, Options{}).Snapshot()
+			s := mustOpen(t, fx, Options{}).Snapshot(bg)
 			for g, n := range acked {
 				if n == 0 {
 					continue
 				}
-				it, ok := s.Get(fmt.Appendf(nil, "g%02d", g))
+				it, ok := s.Get(bg, fmt.Appendf(nil, "g%02d", g))
 				got, _ := strconv.Atoi(string(it.Value))
 				// The batch after the last acknowledged one may have been
 				// committed by the final group.
@@ -767,8 +785,9 @@ func TestInjectedFailures(t *testing.T) {
 
 func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 	fx := faultfs.New()
-	logger, logs := captureLogger()
-	db := mustOpen(t, fx, Options{GroupWindow: 150 * time.Millisecond, Logger: logger})
+	var logs syncBuffer
+	ctx := zerowrap.WithCtx(bg, zerowrap.New(zerowrap.Config{Level: "debug", Format: "json", Output: &logs}))
+	db := mustOpenCtx(t, ctx, fx, Options{GroupWindow: 150 * time.Millisecond})
 	putKV(t, db, "before", "1")
 	f.inject(fx)
 
@@ -792,7 +811,7 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 			t.Fatalf("batch %d: %v does not wrap %v", i, err, f.cause)
 		}
 	}
-	if !strings.Contains(logs.String(), "database failed") {
+	if !strings.Contains(logs.String(), `"level":"error"`) || !strings.Contains(logs.String(), "database failed") {
 		t.Errorf("failure not logged: %q", logs.String())
 	}
 
@@ -808,27 +827,27 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 	if _, err := db.Apply(bg, &empty); !errors.Is(err, ErrFailed) {
 		t.Fatalf("empty Apply on a failed db: %v", err)
 	}
-	s := db.Snapshot()
+	s := db.Snapshot(bg)
 	if s.Seq() != 1 || s.Len() != 1 {
 		t.Fatalf("snapshot after failure: seq %d len %d", s.Seq(), s.Len())
 	}
 	mustGet(t, s, "before", "1")
 	mustMissing(t, s, "failed0")
-	if err := db.Close(); !errors.Is(err, ErrFailed) {
+	if err := db.Close(bg); !errors.Is(err, ErrFailed) {
 		t.Fatalf("Close = %v, want the failure", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Fatalf("second Close = %v", err)
 	}
 
 	if powerLoss {
 		fx.PowerLoss(faultfs.PowerLossOptions{})
 	}
-	s = mustOpen(t, fx, Options{}).Snapshot()
+	s = mustOpen(t, fx, Options{}).Snapshot(bg)
 	mustGet(t, s, "before", "1")
 	present := 0
 	for i := range group {
-		if _, ok := s.Get(fmt.Appendf(nil, "failed%d", i)); ok {
+		if _, ok := s.Get(bg, fmt.Appendf(nil, "failed%d", i)); ok {
 			present++
 		}
 	}
@@ -868,12 +887,6 @@ func TestFailedWriterAnswersOverflow(t *testing.T) {
 	}
 }
 
-// captureLogger returns a logger writing to a buffer.
-func captureLogger() (*slog.Logger, *syncBuffer) {
-	var sb syncBuffer
-	return slog.New(slog.NewTextHandler(&sb, nil)), &sb
-}
-
 type syncBuffer struct {
 	mu sync.Mutex
 	b  strings.Builder
@@ -910,8 +923,10 @@ func powerLossBase(t *testing.T) uint64 {
 // Every writer g applies batches n = 0, 1, … that set cur/g = n and
 // all/g/n, and delete all/g/(n-1). The recovered state therefore says how
 // many batches of each writer were applied, and the seq must equal their sum.
-// (PowerLossOptions.KeepPages is not exercised: see the open question about
-// recovery rule 6 under out-of-order page writeback.)
+// The modes include KeepPages (a random subset of the unsynced pages
+// survives). They always run with NoSync=false: with NoSync, KeepPages can
+// legitimately make Open fail with ErrCorrupt, which is documented on
+// Options.NoSync and not tested.
 func TestPowerLoss(t *testing.T) {
 	modes := []struct {
 		name string
@@ -919,6 +934,10 @@ func TestPowerLoss(t *testing.T) {
 	}{
 		{"drop", faultfs.PowerLossOptions{}},
 		{"zerofill", faultfs.PowerLossOptions{ZeroFill: true}},
+		// Pages of the unsynced tail reach the disk in any order. One record
+		// per group makes this safe when commits are synced.
+		{"keeppages", faultfs.PowerLossOptions{KeepPages: true}},
+		{"keeppages+zerofill", faultfs.PowerLossOptions{KeepPages: true, ZeroFill: true}},
 	}
 	base := powerLossBase(t)
 	iterations := short(150, 10)
@@ -937,7 +956,7 @@ func TestPowerLoss(t *testing.T) {
 func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok bool) {
 	rng := rand.New(rand.NewPCG(seed, 0x9e3779b97f4a7c15))
 	fx := faultfs.New()
-	db, err := open(fx, testDir, Options{GroupWindow: time.Duration(rng.IntN(3)) * 100 * time.Microsecond})
+	db, err := open(testCtx(t), fx, testDir, Options{GroupWindow: time.Duration(rng.IntN(3)) * 100 * time.Microsecond})
 	if err != nil {
 		t.Errorf("seed %d: open: %v", seed, err)
 		return false
@@ -966,39 +985,43 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok b
 		})
 	}
 	time.Sleep(time.Duration(rng.IntN(4000)) * time.Microsecond)
+	plo.Rand = rand.New(rand.NewPCG(seed, 7))
+	if plo.KeepPages {
+		plo.PageSize = 64 // small pages: a group record spans several of them
+	}
 	fx.PowerLoss(plo)
 	wg.Wait()
-	_ = db.Close()
+	_ = db.Close(bg)
 	fx.SetSyncDelay(0)
 
-	db, err = open(fx, testDir, Options{})
+	db, err = open(testCtx(t), fx, testDir, Options{})
 	if err != nil {
 		t.Errorf("seed %d: reopen after power loss: %v", seed, err)
 		return false
 	}
-	defer db.Close()
-	if !checkPowerLossState(t, seed, db.Snapshot(), acked, ackSeq) {
+	defer func() { _ = db.Close(bg) }()
+	if !checkPowerLossState(t, seed, db.Snapshot(bg), acked, ackSeq) {
 		return false
 	}
 
 	// The recovered log accepts new records and survives another reopen.
-	seq := db.Snapshot().Seq()
+	seq := db.Snapshot(bg).Seq()
 	if got := putKV(t, db, "after", "x"); got != seq+1 {
 		t.Errorf("seed %d: seq after recovery = %d, want %d", seed, got, seq+1)
 		return false
 	}
-	if err := db.Close(); err != nil {
+	if err := db.Close(bg); err != nil {
 		t.Errorf("seed %d: Close: %v", seed, err)
 		return false
 	}
-	db, err = open(fx, testDir, Options{})
+	db, err = open(testCtx(t), fx, testDir, Options{})
 	if err != nil {
 		t.Errorf("seed %d: second reopen: %v", seed, err)
 		return false
 	}
-	defer db.Close()
-	if db.Snapshot().Seq() != seq+1 {
-		t.Errorf("seed %d: seq after second reopen = %d, want %d", seed, db.Snapshot().Seq(), seq+1)
+	defer func() { _ = db.Close(bg) }()
+	if db.Snapshot(bg).Seq() != seq+1 {
+		t.Errorf("seed %d: seq after second reopen = %d, want %d", seed, db.Snapshot(bg).Seq(), seq+1)
 		return false
 	}
 	return true
@@ -1012,7 +1035,7 @@ func checkPowerLossState(t *testing.T, seed uint64, s *Snapshot, acked []int, ac
 	var applied uint64
 	keys := 0
 	for g := range acked {
-		it, ok := s.Get(fmt.Appendf(nil, "cur/%d", g))
+		it, ok := s.Get(bg, fmt.Appendf(nil, "cur/%d", g))
 		last := -1
 		if ok {
 			n, err := strconv.Atoi(string(it.Value))
@@ -1030,12 +1053,12 @@ func checkPowerLossState(t *testing.T, seed uint64, s *Snapshot, acked []int, ac
 		if !ok {
 			continue
 		}
-		cur, ok := s.Get(fmt.Appendf(nil, "all/%d/%d", g, last))
+		cur, ok := s.Get(bg, fmt.Appendf(nil, "all/%d/%d", g, last))
 		if !ok || cur.Version != it.Version {
 			return fail("writer %d: batch %d is partially applied (%v, %v)", g, last, cur, ok)
 		}
 		count := 0
-		for range s.Prefix(fmt.Appendf(nil, "all/%d/", g)) {
+		for range s.Prefix(bg, fmt.Appendf(nil, "all/%d/", g)) {
 			count++
 		}
 		if count != 1 {
@@ -1082,11 +1105,11 @@ func (f countFile) Sync() error {
 // around the OS file system, so the numbers are real fdatasync calls.
 func BenchmarkApply(b *testing.B) {
 	fx := &countFS{FS: fsys.OS()}
-	db, err := open(fx, filepath.Join(b.TempDir(), "db"), Options{})
+	db, err := open(bg, fx, filepath.Join(b.TempDir(), "db"), Options{})
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close(bg) }()
 	b.SetParallelism(16)
 	value := bytes.Repeat([]byte("v"), 100)
 	var next atomic.Uint64

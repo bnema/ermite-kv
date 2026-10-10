@@ -85,7 +85,7 @@ func (db *DB) writer() {
 // under maxGroupBytes.
 func (db *DB) collect(first *request) (overflow *request) {
 	db.group = append(db.group[:0], first)
-	size := first.b.payload()
+	size := recordHead + first.b.encodedSize()
 	var expired <-chan time.Time
 	if w := db.opts.GroupWindow; w > 0 {
 		t := time.NewTimer(w)
@@ -109,7 +109,7 @@ func (db *DB) collect(first *request) (overflow *request) {
 				return nil
 			}
 		}
-		if p := r.b.payload(); size+p <= maxGroupBytes {
+		if p := r.b.encodedSize(); size+p <= maxGroupBytes {
 			db.group = append(db.group, r)
 			size += p
 		} else {
@@ -128,6 +128,8 @@ func (db *DB) commit() bool {
 	seq := cur.seq
 	buf := db.buf[:0]
 	results := make([]result, len(db.group))
+	var batches int
+	var firstSeq uint64
 
 	for i, r := range db.group {
 		b := r.b
@@ -147,7 +149,12 @@ func (db *DB) commit() bool {
 				bld.delete(o.key)
 			}
 		}
-		buf = appendRecord(buf, seq, b.ops)
+		if batches == 0 {
+			firstSeq = seq
+			buf = beginRecord(buf, seq)
+		}
+		buf = appendBatch(buf, b.ops)
+		batches++
 		results[i] = result{seq: seq}
 	}
 	db.buf = buf[:0]
@@ -155,8 +162,10 @@ func (db *DB) commit() bool {
 		db.buf = nil // do not pin the memory of one huge batch
 	}
 
-	if len(buf) > 0 {
-		if err := db.persist(buf); err != nil {
+	if batches > 0 {
+		finishRecord(buf, batches)
+		syncTime, err := db.persist(buf)
+		if err != nil {
 			err = db.fail(err)
 			for _, r := range db.group {
 				r.reply <- result{err: err}
@@ -165,6 +174,8 @@ func (db *DB) commit() bool {
 		}
 		db.logSize += int64(len(buf))
 		db.snap.Store(newSnapshot(bld.freeze(), seq))
+		db.log.Debug().Uint64("seq", firstSeq).Int("batches", batches).Int("bytes", len(buf)).
+			Dur("sync", syncTime).Msg("group committed")
 	}
 	for i, r := range db.group {
 		r.reply <- results[i]
@@ -172,21 +183,24 @@ func (db *DB) commit() bool {
 	return true
 }
 
-// persist appends buf to the log and syncs it (unless NoSync).
-func (db *DB) persist(buf []byte) error {
-	n, err := db.log.Write(buf)
+// persist appends buf to the log and syncs it (unless NoSync). It returns
+// the time spent in the sync.
+func (db *DB) persist(buf []byte) (time.Duration, error) {
+	n, err := db.file.Write(buf)
 	if err == nil && n < len(buf) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		return fmt.Errorf("write log: %w", err)
+		return 0, fmt.Errorf("write log: %w", err)
 	}
-	if !db.opts.NoSync {
-		if err := db.log.Sync(); err != nil {
-			return fmt.Errorf("sync log: %w", err)
-		}
+	if db.opts.NoSync {
+		return 0, nil
 	}
-	return nil
+	start := time.Now()
+	if err := db.file.Sync(); err != nil {
+		return 0, fmt.Errorf("sync log: %w", err)
+	}
+	return time.Since(start), nil
 }
 
 // fail puts the database in the failed state, keeping the first cause, and
@@ -194,7 +208,7 @@ func (db *DB) persist(buf []byte) error {
 func (db *DB) fail(cause error) error {
 	db.failOnce.Do(func() {
 		db.failErr = fmt.Errorf("%w: %w", ErrFailed, cause)
-		db.opts.Logger.Error("kv: database failed", "err", cause)
+		db.log.Error().Err(cause).Msg("database failed")
 		close(db.failed)
 	})
 	return db.failErr

@@ -28,25 +28,43 @@ func opsEqual(a, b []op) bool {
 
 func TestRecordRoundTrip(t *testing.T) {
 	ops := sampleOps()
-	enc := appendRecord([]byte("prefix"), 42, ops)[6:]
+	second := []op{{kind: opDelete, key: []byte("z")}}
+	enc := appendRecord([]byte("prefix"), 42, ops, second, ops[:1])[6:]
 	size := 0
-	for _, o := range ops {
-		size += opSize(o)
+	for _, b := range [][]op{ops, second, ops[:1]} {
+		size += batchHeader
+		for _, o := range b {
+			size += opSize(o)
+		}
 	}
-	if want := recordFrame + recordMinBody + size; len(enc) != want {
+	if want := recordFrame + recordHead + size; len(enc) != want {
 		t.Fatalf("encoded size = %d, want %d", len(enc), want)
 	}
-	seq, got, n, err := decodeRecord(append(enc, 0xff, 0xee), nil)
+	seq, got, n, err := decodeRecord(append(enc, 0xff, 0xee))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seq != 42 || n != len(enc) || !opsEqual(got, ops) {
-		t.Fatalf("got seq=%d n=%d ops=%v", seq, n, got)
+	if seq != 42 || n != len(enc) || len(got) != 3 ||
+		!opsEqual(got[0], ops) || !opsEqual(got[1], second) || !opsEqual(got[2], ops[:1]) {
+		t.Fatalf("got seq=%d n=%d batches=%v", seq, n, got)
 	}
-	owned := ownOps(got)
+	owned := ownOps(got[0])
 	clear(enc)
 	if !opsEqual(owned, ops) {
 		t.Fatal("ownOps aliases the source buffer")
+	}
+}
+
+// TestRecordBuilder checks that beginRecord/appendBatch/finishRecord produce
+// the same bytes as appendRecord.
+func TestRecordBuilder(t *testing.T) {
+	ops := sampleOps()
+	rec := beginRecord(nil, 7)
+	rec = appendBatch(rec, ops)
+	rec = appendBatch(rec, ops[:2])
+	finishRecord(rec, 2)
+	if want := appendRecord(nil, 7, ops, ops[:2]); !bytes.Equal(rec, want) {
+		t.Fatal("builder output differs from appendRecord")
 	}
 }
 
@@ -77,43 +95,62 @@ func rawRecord(payload []byte) []byte {
 	return append(b, payload...)
 }
 
-func rawPayload(seq uint64, count uint32, body ...byte) []byte {
+// rawPayload builds a payload from the seq, the batch count and raw batch
+// bytes.
+func rawPayload(seq uint64, batches uint32, body ...byte) []byte {
 	p := binary.LittleEndian.AppendUint64(nil, seq)
-	p = binary.LittleEndian.AppendUint32(p, count)
+	p = binary.LittleEndian.AppendUint32(p, batches)
 	return append(p, body...)
 }
 
+// rawBatch encodes a batch header and raw op bytes.
+func rawBatch(count uint32, ops ...byte) []byte {
+	return append(binary.LittleEndian.AppendUint32(nil, count), ops...)
+}
+
+func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+
 func TestDecodeRecordUnreadable(t *testing.T) {
-	good := appendRecord(nil, 1, []op{{kind: opPut, key: []byte("k"), value: []byte("v")}})
+	one := []op{{kind: opPut, key: []byte("k"), value: []byte("v")}}
+	good := appendRecord(nil, 1, one)
 	badCRC := slices.Clone(good)
 	badCRC[len(badCRC)-1] ^= 1
 	tooBig := binary.LittleEndian.AppendUint32(nil, maxRecord+1)
 	tooBig = append(tooBig, make([]byte, 16)...)
+	put := rawBatch(1, opPut, 1, 'k', 1, 'v')
+	del := rawBatch(1, opDelete, 1, 'k')
 	cases := map[string][]byte{
-		"empty":           nil,
-		"short frame":     good[:7],
-		"short payload":   good[:len(good)-1],
-		"bad crc":         badCRC,
-		"len too small":   rawRecord(make([]byte, 11)),
-		"len too big":     tooBig,
-		"zero count":      rawRecord(rawPayload(1, 0)),
-		"count too big":   rawRecord(rawPayload(1, 2, opPut, 1, 'k', 1, 'v')),
-		"count too small": rawRecord(rawPayload(1, 1, opPut, 1, 'k', 1, 'v', opDelete, 1, 'k')),
-		"bad kind":        rawRecord(rawPayload(1, 1, 3, 1, 'k')),
-		"empty key":       rawRecord(rawPayload(1, 1, opDelete, 0, 0)),
-		"key past end":    rawRecord(rawPayload(1, 1, opDelete, 9, 'k')),
-		"value past end":  rawRecord(rawPayload(1, 1, opPut, 1, 'k', 5, 'v')),
-		"trailing byte":   rawRecord(rawPayload(1, 1, opDelete, 1, 'k', 0)),
-		"huge count":      rawRecord(rawPayload(1, 0xffffffff, opDelete, 1, 'k')),
+		"empty":            nil,
+		"short frame":      good[:7],
+		"short payload":    good[:len(good)-1],
+		"bad crc":          badCRC,
+		"len too small":    rawRecord(make([]byte, 15)),
+		"len too big":      tooBig,
+		"zero batches":     rawRecord(rawPayload(1, 0, put...)),
+		"batches too big":  rawRecord(rawPayload(1, 2, put...)),
+		"batches too few":  rawRecord(rawPayload(1, 1, cat(put, del)...)),
+		"zero ops":         rawRecord(rawPayload(1, 1, rawBatch(0, opDelete, 1, 'k')...)),
+		"zero ops 2nd":     rawRecord(rawPayload(1, 2, cat(put, rawBatch(0))...)),
+		"ops too many":     rawRecord(rawPayload(1, 1, rawBatch(2, opPut, 1, 'k', 1, 'v')...)),
+		"ops too few":      rawRecord(rawPayload(1, 1, rawBatch(1, opPut, 1, 'k', 1, 'v', opDelete, 1, 'k')...)),
+		"bad kind":         rawRecord(rawPayload(1, 1, rawBatch(1, 3, 1, 'k')...)),
+		"empty key":        rawRecord(rawPayload(1, 1, rawBatch(1, opDelete, 0, 0)...)),
+		"key past end":     rawRecord(rawPayload(1, 1, rawBatch(1, opDelete, 9, 'k')...)),
+		"value past end":   rawRecord(rawPayload(1, 1, rawBatch(1, opPut, 1, 'k', 5, 'v')...)),
+		"trailing byte":    rawRecord(rawPayload(1, 1, cat(del, []byte{0})...)),
+		"huge batches":     rawRecord(rawPayload(1, 0xffffffff, del...)),
+		"huge op count":    rawRecord(rawPayload(1, 1, rawBatch(0xffffffff, opDelete, 1, 'k')...)),
+		"truncated batch":  rawRecord(rawPayload(1, 2, cat(del, []byte{1, 0})...)),
+		"second batch bad": rawRecord(rawPayload(1, 2, cat(del, rawBatch(1, 9, 1, 'k'))...)),
 	}
 	for name, b := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, _, _, err := decodeRecord(b, nil); !errors.Is(err, errUnreadable) {
+			if _, _, _, err := decodeRecord(b); !errors.Is(err, errUnreadable) {
 				t.Fatalf("err = %v, want errUnreadable", err)
 			}
 		})
 	}
-	if _, _, _, err := decodeRecord(rawRecord(rawPayload(1, 1, opDelete, 1, 'k')), nil); err != nil {
+	if _, _, _, err := decodeRecord(rawRecord(rawPayload(1, 1, del...))); err != nil {
 		t.Fatalf("control record: %v", err)
 	}
 }
@@ -209,7 +246,6 @@ func TestSnapshotStructure(t *testing.T) {
 		b = binary.AppendUvarint(b, uint64(len(v)))
 		return append(b, v...)
 	}
-	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 	cases := map[string][]byte{
 		"not ascending":  forgeSnapshot(5, 2, cat(entry("b", 1, ""), entry("a", 1, ""))),
 		"duplicate key":  forgeSnapshot(5, 2, cat(entry("a", 1, ""), entry("a", 2, ""))),
@@ -259,8 +295,9 @@ func TestWriteSnapshotRejectsBadInput(t *testing.T) {
 
 func FuzzDecodeRecord(f *testing.F) {
 	f.Add(appendRecord(nil, 1, sampleOps()))
+	f.Add(appendRecord(nil, 1, sampleOps(), sampleOps()[:2]))
 	f.Add(appendRecord(nil, 1<<40, []op{{kind: opDelete, key: []byte("k")}}))
-	f.Add(rawRecord(rawPayload(1, 1, opDelete, 1, 'k')))
+	f.Add(rawRecord(rawPayload(1, 1, rawBatch(1, opDelete, 1, 'k')...)))
 	f.Add([]byte{})
 	f.Add(make([]byte, 64))
 	f.Add(appendLogHeader(nil, 7))
@@ -272,19 +309,29 @@ func FuzzDecodeRecord(f *testing.F) {
 			view.each(func(k, v []byte, ver uint64) {})
 		}
 		peekRecord(b)
-		seq, ops, n, err := decodeRecord(b, nil)
+		seq, batches, n, err := decodeRecord(b)
 		if err != nil {
 			return
 		}
 		// A readable record survives re-encoding (varints may be
 		// non-canonical in the input, so the bytes can differ).
-		if n > len(b) || len(ops) == 0 {
-			t.Fatalf("n=%d len=%d ops=%d", n, len(b), len(ops))
+		if n > len(b) || len(batches) == 0 {
+			t.Fatalf("n=%d len=%d batches=%d", n, len(b), len(batches))
 		}
-		enc := appendRecord(nil, seq, ops)
-		seq2, ops2, n2, err := decodeRecord(enc, nil)
-		if err != nil || seq2 != seq || n2 != len(enc) || !opsEqual(ops2, ops) {
+		for _, ops := range batches {
+			if len(ops) == 0 {
+				t.Fatal("readable record with an empty batch")
+			}
+		}
+		enc := appendRecord(nil, seq, batches...)
+		seq2, batches2, n2, err := decodeRecord(enc)
+		if err != nil || seq2 != seq || n2 != len(enc) || len(batches2) != len(batches) {
 			t.Fatalf("round trip failed: err=%v", err)
+		}
+		for i := range batches {
+			if !opsEqual(batches[i], batches2[i]) {
+				t.Fatalf("batch %d differs after round trip", i)
+			}
 		}
 	})
 }

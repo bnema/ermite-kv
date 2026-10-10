@@ -6,10 +6,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bnema/zerowrap"
 
 	"bnema.dev/ermite-kv/internal/fsys"
 )
@@ -18,16 +19,23 @@ import (
 const (
 	defaultMaxBatchBytes = 16 << 20
 	defaultCompactAfter  = 64 << 20
+
+	// maxBatchLimit is the largest encoded batch that fits in a record
+	// together with the record head (seq and batch count).
+	maxBatchLimit = maxRecord - recordHead
 )
 
 // Options configures Open. The zero value of every field means "default";
 // Options{} is safe and durable.
 type Options struct {
 	// NoSync skips fdatasync on commits. For tests and benchmarks only: an
-	// acknowledged batch may be lost on power failure.
+	// acknowledged batch may be lost on power failure, and a power loss can
+	// leave a log that Open rejects with ErrCorrupt (the pages of one
+	// unsynced group may reach the disk out of order, which recovery cannot
+	// tell from damage to acknowledged data).
 	NoSync bool
-	// MaxBatchBytes is the encoded batch limit. 0 means 16 MiB; it must be
-	// at most 64 MiB (the format limit).
+	// MaxBatchBytes is the encoded batch limit (op count and ops). 0 means
+	// 16 MiB; it must be at most 64 MiB minus 12 bytes (the format limit).
 	MaxBatchBytes int
 	// CompactAfter is the number of bytes in the current log that trigger
 	// compaction. 0 means 64 MiB; a negative value disables compaction.
@@ -35,15 +43,13 @@ type Options struct {
 	// GroupWindow is the extra time the writer waits to grow a commit
 	// group. 0 means it only drains what is already queued.
 	GroupWindow time.Duration
-	// Logger receives warnings and errors. nil discards them.
-	Logger *slog.Logger
 }
 
 // resolve validates o and fills in the defaults.
 func (o Options) resolve() (Options, error) {
 	switch {
-	case o.MaxBatchBytes < 0 || o.MaxBatchBytes > maxRecord:
-		return o, fmt.Errorf("kv: invalid MaxBatchBytes %d: must be in [0, %d]", o.MaxBatchBytes, maxRecord)
+	case o.MaxBatchBytes < 0 || o.MaxBatchBytes > maxBatchLimit:
+		return o, fmt.Errorf("kv: invalid MaxBatchBytes %d: must be in [0, %d]", o.MaxBatchBytes, maxBatchLimit)
 	case o.GroupWindow < 0:
 		return o, fmt.Errorf("kv: invalid GroupWindow %v: must not be negative", o.GroupWindow)
 	}
@@ -53,9 +59,6 @@ func (o Options) resolve() (Options, error) {
 	if o.CompactAfter == 0 {
 		o.CompactAfter = defaultCompactAfter
 	}
-	if o.Logger == nil {
-		o.Logger = slog.New(slog.DiscardHandler)
-	}
 	return o, nil
 }
 
@@ -63,7 +66,9 @@ func (o Options) resolve() (Options, error) {
 // for concurrent use.
 type DB struct {
 	fx   fsys.FS
+	dir  string
 	opts Options
+	log  zerowrap.Logger          // captured at Open; used by the writer
 	snap atomic.Pointer[Snapshot] // last published state
 
 	reqCh   chan *request // never closed
@@ -75,12 +80,11 @@ type DB struct {
 	failErr  error // first cause, wrapping ErrFailed; set before failed is closed
 
 	closeOnce sync.Once
-	closeErr  error
 
 	lock io.Closer
 
 	// Owned by the writer goroutine (see writer.go).
-	log     fsys.File
+	file    fsys.File
 	logBase uint64 // seq the current log starts after
 	logSize int64  // bytes in the current log, header included
 	buf     []byte // group encoding buffer
@@ -91,17 +95,23 @@ type DB struct {
 // takes an exclusive lock on the directory, returning ErrLocked if another
 // DB holds it, and recovers the state from the snapshot and logs. Invalid
 // options are an error.
-func Open(dir string, opts Options) (*DB, error) {
-	return open(fsys.OS(), dir, opts)
+//
+// The logger of ctx (zerowrap.FromCtx), enriched with the component and the
+// directory, is used for the life of the DB; ctx is not used for anything
+// else and does not bound the life of the DB.
+func Open(ctx context.Context, dir string, opts Options) (*DB, error) {
+	return open(ctx, fsys.OS(), dir, opts)
 }
 
-func open(fx fsys.FS, dir string, opts Options) (*DB, error) {
+func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error) {
 	opts, err := opts.resolve()
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
+	log := zerowrap.FromCtxWithFields(ctx, map[string]any{"component": "ermite-kv", "dir": dir})
 	bld := tree{}.builder()
-	rec, err := recoverDir(fx, dir, opts.Logger,
+	rec, err := recoverDir(fx, dir, log,
 		func(key, value []byte, version uint64) {
 			// Snapshot entries alias one shared file buffer: copy them so
 			// the tree does not keep the whole buffer alive.
@@ -124,29 +134,36 @@ func open(fx fsys.FS, dir string, opts Options) (*DB, error) {
 	}
 	db := &DB{
 		fx:      fx,
+		dir:     dir,
 		opts:    opts,
+		log:     log,
 		reqCh:   make(chan *request),
 		closing: make(chan struct{}),
 		done:    make(chan struct{}),
 		failed:  make(chan struct{}),
 		lock:    rec.lock,
-		log:     rec.log,
+		file:    rec.log,
 		logBase: rec.logBase,
 		logSize: rec.logSize,
 	}
-	db.snap.Store(newSnapshot(bld.freeze(), rec.lastSeq))
+	t := bld.freeze()
+	db.snap.Store(newSnapshot(t, rec.lastSeq))
 	go db.writer()
+	log.Info().Uint64("seq", rec.lastSeq).Int("keys", t.len()).Uint64("snapshot_seq", rec.snapSeq).
+		Dur("duration", time.Since(start)).Msg("opened")
 	return db, nil
 }
 
 // Close stops the database: requests not yet taken by the writer get
 // ErrClosed, the group in progress is committed and acknowledged, then the
 // log is closed and the directory lock released. Snapshots stay readable.
+// Close always completes: ctx is only used for the logger of the closing
+// message.
 //
 // Close returns the first error met while stopping, including the cause of
 // the failed state if the database failed, or nil. It is idempotent: later
 // calls return nil.
-func (db *DB) Close() error {
+func (db *DB) Close(ctx context.Context) error {
 	var err error
 	db.closeOnce.Do(func() {
 		close(db.closing)
@@ -157,22 +174,26 @@ func (db *DB) Close() error {
 			err = db.failErr
 		default:
 		}
-		if cerr := db.log.Close(); err == nil {
+		if cerr := db.file.Close(); err == nil {
 			err = cerr
 		}
 		if cerr := db.lock.Close(); err == nil {
 			err = cerr
 		}
+		log := zerowrap.FromCtxWithFields(ctx, map[string]any{"component": "ermite-kv", "dir": db.dir})
+		log.Info().Uint64("seq", db.snap.Load().Seq()).Err(err).Msg("closed")
 	})
 	return err
 }
 
 // Snapshot returns the current immutable state. It is lock-free and O(1), and
-// remains usable after Close.
-func (db *DB) Snapshot() *Snapshot { return db.snap.Load() }
+// remains usable after Close. Like every read, it ignores ctx.
+func (db *DB) Snapshot(_ context.Context) *Snapshot { return db.snap.Load() }
 
 // Get returns the item stored under key in the current snapshot.
-func (db *DB) Get(key []byte) (Item, bool) { return db.snap.Load().Get(key) }
+func (db *DB) Get(ctx context.Context, key []byte) (Item, bool) {
+	return db.snap.Load().Get(ctx, key)
+}
 
 // Apply commits b atomically and returns its seq once it is durable (unless
 // Options.NoSync) and visible in Snapshot.
@@ -193,7 +214,7 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 	if b.err != nil {
 		return 0, b.err
 	}
-	if b.payload() > db.opts.MaxBatchBytes {
+	if b.encodedSize() > db.opts.MaxBatchBytes {
 		return 0, ErrBatchTooLarge
 	}
 	select {
@@ -219,6 +240,6 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 		return 0, r.release(db.failErr)
 	}
 	res := <-r.reply // the writer always answers a request it has taken
-	r.release(nil)
+	_ = r.release(nil)
 	return res.seq, res.err
 }

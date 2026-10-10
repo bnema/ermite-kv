@@ -52,8 +52,8 @@ func TestBatchErrors(t *testing.T) {
 				t.Fatalf("err = %v, want ErrInvalidKey", b.err)
 			}
 			b.Reset()
-			if b.err != nil || b.Len() != 0 || b.payload() != 0 {
-				t.Fatalf("Reset left err=%v len=%d payload=%d", b.err, b.Len(), b.payload())
+			if b.err != nil || b.Len() != 0 || b.encodedSize() != 0 {
+				t.Fatalf("Reset left err=%v len=%d size=%d", b.err, b.Len(), b.encodedSize())
 			}
 		})
 	}
@@ -65,19 +65,19 @@ func TestBatchErrors(t *testing.T) {
 	}
 }
 
-func TestBatchPayload(t *testing.T) {
+func TestBatchEncodedSize(t *testing.T) {
 	var b Batch
-	if b.payload() != 0 {
+	if b.encodedSize() != 0 {
 		t.Fatal("empty batch has a payload")
 	}
 	b.RequireAbsent([]byte("k"))
-	if b.payload() != 0 {
+	if b.encodedSize() != 0 {
 		t.Fatal("precondition-only batch has a payload")
 	}
 	b.Put([]byte("k"), []byte(strings.Repeat("v", 200)))
 	b.Delete([]byte("kk"))
-	want := len(appendRecord(nil, 1, b.ops)) - recordFrame
-	if got := b.payload(); got != want {
-		t.Fatalf("payload = %d, encoded record payload = %d", got, want)
+	want := len(appendRecord(nil, 1, b.ops)) - recordFrame - recordHead
+	if got := b.encodedSize(); got != want {
+		t.Fatalf("payload = %d, encoded batch = %d", got, want)
 	}
 }

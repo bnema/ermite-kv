@@ -80,13 +80,14 @@ func (b *Batch) Reset() {
 	b.err = nil
 }
 
-// payload returns the encoded record payload size; 0 for a batch without
-// ops, which writes nothing.
-func (b *Batch) payload() int {
+// encodedSize returns the size of the batch in a log record (op count and
+// ops), which MaxBatchBytes limits; 0 for a batch without ops, which writes
+// nothing.
+func (b *Batch) encodedSize() int {
 	if len(b.ops) == 0 {
 		return 0
 	}
-	return recordMinBody + b.opsBytes
+	return batchHeader + b.opsBytes
 }
 
 func (b *Batch) add(o op) {

@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/bnema/zerowrap"
 
 	"bnema.dev/ermite-kv/internal/fsys"
 )
@@ -60,21 +61,19 @@ type recovered struct {
 // the in-memory tree.
 //
 // load is called once per snapshot entry in ascending key order, only after
-// the whole snapshot file has been validated. apply is called for each log
-// record newer than the snapshot, in seq order. Both receive freshly
-// allocated slices that the callee may retain but must not modify; recovery
-// never reuses them (snapshot entries share one read-only buffer, log ops are
-// copied per record). Either callback may be nil. A nil logger discards logs.
+// the whole snapshot file has been validated. apply is called for each batch
+// newer than the snapshot, in seq order (a record that straddles the snapshot
+// seq contributes only its newer batches). The ops passed to apply are freshly
+// allocated and the callee may retain them but must not modify them. load
+// receives slices of one shared read-only buffer: it must copy what it keeps.
+// Either callback may be nil. A zero logger discards logs.
 //
 // On error nothing stays open or locked. ErrLocked and ErrCorrupt are
 // returned wrapped.
-func recoverDir(fx fsys.FS, dir string, logger *slog.Logger,
+func recoverDir(fx fsys.FS, dir string, logger zerowrap.Logger,
 	load func(key, value []byte, version uint64),
 	apply func(seq uint64, ops []op),
 ) (rec recovered, err error) {
-	if logger == nil {
-		logger = slog.New(slog.DiscardHandler)
-	}
 	dir = filepath.Clean(dir)
 	if err := fx.MkdirAll(dir, 0o700); err != nil {
 		return rec, err
@@ -138,7 +137,7 @@ func recoverDir(fx fsys.FS, dir string, logger *slog.Logger,
 			err = fmt.Errorf("%w: snapshot seq %d does not match its name", ErrCorrupt, view.seq)
 		}
 		if err != nil {
-			logger.Warn("kv: ignoring invalid snapshot", "file", path, "err", err)
+			logger.Warn().Err(err).Str("file", path).Msg("ignoring invalid snapshot")
 			continue
 		}
 		if load != nil {
@@ -200,7 +199,7 @@ func recoverDir(fx fsys.FS, dir string, logger *slog.Logger,
 // the last log it is used to truncate a torn tail. It returns the size of the
 // log after recovery.
 func replayLog(f fsys.File, data []byte, path string, base uint64, rec *recovered,
-	logger *slog.Logger, apply func(seq uint64, ops []op),
+	logger zerowrap.Logger, apply func(seq uint64, ops []op),
 ) (int64, error) {
 	last := f != nil
 	corrupt := func(off int, format string, args ...any) error {
@@ -217,20 +216,18 @@ func replayLog(f fsys.File, data []byte, path string, base uint64, rec *recovere
 		return 0, corrupt(0, "base %d is above the last recovered seq %d", base, rec.lastSeq)
 	}
 
-	var ops []op
-	expected := base + 1 // seq of the next record of this file
+	expected := base + 1 // seq of the first batch of the next record
 	off := logHeaderSize
 	for off < len(data) {
-		seq, decoded, n, err := decodeRecord(data[off:], ops)
+		seq, batches, n, err := decodeRecord(data[off:])
 		if err != nil {
 			if !last {
 				return 0, corrupt(off, "%v", err)
 			}
-			// Rule 6: a readable next record means acknowledged data
-			// lies beyond the damage.
+			// Rule 6: a readable record after the damaged one proves that
+			// the damaged one was synced: acknowledged data is damaged.
 			if total, ok := peekRecord(data[off:]); ok && off+total < len(data) {
-				nseq, _, _, nerr := decodeRecord(data[off+total:], nil)
-				if nerr == nil && nseq == expected+1 {
+				if _, _, _, nerr := decodeRecord(data[off+total:]); nerr == nil {
 					return 0, corrupt(off, "%v, followed by a valid record", err)
 				}
 			}
@@ -240,24 +237,28 @@ func replayLog(f fsys.File, data []byte, path string, base uint64, rec *recovere
 			if err := f.SyncAll(); err != nil {
 				return 0, err
 			}
-			logger.Warn("kv: dropped torn log tail", "file", path, "offset", off, "bytes", len(data)-off)
+			logger.Warn().Str("file", path).Int("offset", off).Int("bytes", len(data)-off).
+				Msg("dropped torn log tail")
 			data = data[:off]
 			break
 		}
-		ops = decoded[:0]
 		if seq != expected {
 			return 0, corrupt(off, "record seq %d, want %d", seq, expected)
 		}
-		if seq > rec.snapSeq {
-			if seq != rec.lastSeq+1 {
-				return 0, corrupt(off, "record seq %d, want %d", seq, rec.lastSeq+1)
+		for i, ops := range batches {
+			s := seq + uint64(i)
+			if s <= rec.snapSeq {
+				continue
+			}
+			if s != rec.lastSeq+1 {
+				return 0, corrupt(off, "batch seq %d, want %d", s, rec.lastSeq+1)
 			}
 			if apply != nil {
-				apply(seq, ownOps(decoded))
+				apply(s, ownOps(ops))
 			}
-			rec.lastSeq = seq
+			rec.lastSeq = s
 		}
-		expected++
+		expected += uint64(len(batches))
 		off += n
 	}
 	if last && expected-1 < rec.lastSeq {

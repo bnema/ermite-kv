@@ -29,7 +29,9 @@ const (
 	snapshotMagic  = "EKVSNP01"
 	logHeaderSize  = 8 + 8 + 4
 	recordFrame    = 4 + 4 // len + crc
-	recordMinBody  = 8 + 4 // seq + count
+	recordHead     = 8 + 4 // seq + batch count
+	batchHeader    = 4     // op count
+	recordMinBody  = 16    // smallest readable payload length
 	snapHeaderSize = 8 + 8 + 8 + 4
 	minOpSize      = 3 // kind + klen + 1 key byte
 )
@@ -85,13 +87,20 @@ func decodeLogHeader(b []byte) (base uint64, err error) {
 	return binary.LittleEndian.Uint64(b[8:16]), nil
 }
 
-// appendRecord appends one encoded record (len, crc, seq, count, ops) to dst.
-// The payload must not exceed maxRecord and ops must be non-empty with valid
-// keys; the caller enforces this (batches are validated before encoding).
-func appendRecord(dst []byte, seq uint64, ops []op) []byte {
-	start := len(dst)
+// beginRecord starts a group record: it appends the frame placeholder, the
+// seq of the first batch and the batch count placeholder to dst. Batches are
+// added with appendBatch and the record is completed by finishRecord, which
+// expects the record to start at index 0 of the slice.
+func beginRecord(dst []byte, seq uint64) []byte {
 	dst = append(dst, make([]byte, recordFrame)...)
 	dst = binary.LittleEndian.AppendUint64(dst, seq)
+	return binary.LittleEndian.AppendUint32(dst, 0)
+}
+
+// appendBatch appends one batch (count, ops) to the record being built. ops
+// must be non-empty with valid keys; the caller enforces this (batches are
+// validated before encoding).
+func appendBatch(dst []byte, ops []op) []byte {
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(ops)))
 	for _, o := range ops {
 		dst = append(dst, o.kind)
@@ -102,15 +111,33 @@ func appendRecord(dst []byte, seq uint64, ops []op) []byte {
 			dst = append(dst, o.value...)
 		}
 	}
-	payload := dst[start+recordFrame:]
-	binary.LittleEndian.PutUint32(dst[start:], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(dst[start+4:], crc32.Checksum(payload, castagnoli))
 	return dst
+}
+
+// finishRecord patches the batch count, length and checksum into rec, which
+// holds exactly one record started by beginRecord.
+func finishRecord(rec []byte, batches int) {
+	binary.LittleEndian.PutUint32(rec[recordFrame+8:], uint32(batches))
+	payload := rec[recordFrame:]
+	binary.LittleEndian.PutUint32(rec, uint32(len(payload)))
+	binary.LittleEndian.PutUint32(rec[4:], crc32.Checksum(payload, castagnoli))
+}
+
+// appendRecord appends one encoded group record to dst. Batch i has seq
+// seq+i. The payload must not exceed maxRecord and every batch must hold
+// valid ops.
+func appendRecord(dst []byte, seq uint64, batches ...[]op) []byte {
+	rec := beginRecord(nil, seq)
+	for _, ops := range batches {
+		rec = appendBatch(rec, ops)
+	}
+	finishRecord(rec, len(batches))
+	return append(dst, rec...)
 }
 
 // peekRecord returns the total encoded size (frame + payload) announced by
 // the record frame at the start of b. ok is false if fewer than 8 bytes are
-// present or the announced payload length is outside [12, maxRecord]. It does
+// present or the announced payload length is outside [16, maxRecord]. It does
 // not check that the payload is present.
 func peekRecord(b []byte) (total int, ok bool) {
 	if len(b) < recordFrame {
@@ -124,13 +151,14 @@ func peekRecord(b []byte) (total int, ok bool) {
 }
 
 // decodeRecord decodes the record at the start of b. A record is readable
-// only if the frame is present, 12 ≤ len ≤ maxRecord, len payload bytes are
-// present, the CRC matches, and the payload holds exactly count ≥ 1 valid
-// ops consuming exactly len bytes. Otherwise the error wraps errUnreadable.
+// only if the frame is present, 16 ≤ len ≤ maxRecord, len payload bytes are
+// present, the CRC matches, and the payload holds batches ≥ 1 batches of
+// count ≥ 1 valid ops each, consuming exactly len bytes. Otherwise the error
+// wraps errUnreadable.
 //
-// The decoded ops are appended to ops[:0]; their keys and values alias b.
-// n is the number of bytes consumed.
-func decodeRecord(b []byte, ops []op) (seq uint64, out []op, n int, err error) {
+// Batch i has seq seq+i. The decoded keys and values alias b. n is the number
+// of bytes consumed.
+func decodeRecord(b []byte) (seq uint64, batches [][]op, n int, err error) {
 	total, ok := peekRecord(b)
 	if !ok {
 		return 0, nil, 0, fmt.Errorf("%w: bad or short frame", errUnreadable)
@@ -142,45 +170,57 @@ func decodeRecord(b []byte, ops []op) (seq uint64, out []op, n int, err error) {
 	if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(b[4:8]) {
 		return 0, nil, 0, fmt.Errorf("%w: checksum mismatch", errUnreadable)
 	}
-	seq, out, err = decodePayload(payload, ops)
+	seq, batches, err = decodePayload(payload)
 	if err != nil {
 		return 0, nil, 0, err
 	}
-	return seq, out, total, nil
+	return seq, batches, total, nil
 }
 
-// decodePayload decodes seq, count and ops from a whole payload.
-func decodePayload(p []byte, ops []op) (uint64, []op, error) {
+// decodePayload decodes seq, batch count and batches from a whole payload.
+func decodePayload(p []byte) (uint64, [][]op, error) {
 	seq := binary.LittleEndian.Uint64(p)
-	count := binary.LittleEndian.Uint32(p[8:])
-	p = p[recordMinBody:]
-	if count == 0 || uint64(count) > uint64(len(p)/minOpSize) {
-		return 0, nil, fmt.Errorf("%w: bad op count %d", errUnreadable, count)
+	nb := binary.LittleEndian.Uint32(p[8:])
+	p = p[recordHead:]
+	if nb == 0 || uint64(nb) > uint64(len(p)/(batchHeader+minOpSize)) {
+		return 0, nil, fmt.Errorf("%w: bad batch count %d", errUnreadable, nb)
 	}
-	ops = ops[:0]
-	for range count {
-		if len(p) == 0 {
-			return 0, nil, fmt.Errorf("%w: truncated op", errUnreadable)
+	batches := make([][]op, 0, nb)
+	for i := range nb {
+		if len(p) < batchHeader {
+			return 0, nil, fmt.Errorf("%w: truncated batch %d", errUnreadable, i)
 		}
-		o := op{kind: p[0]}
-		if o.kind != opPut && o.kind != opDelete {
-			return 0, nil, fmt.Errorf("%w: bad op kind %d", errUnreadable, o.kind)
+		count := binary.LittleEndian.Uint32(p)
+		p = p[batchHeader:]
+		if count == 0 || uint64(count) > uint64(len(p)/minOpSize) {
+			return 0, nil, fmt.Errorf("%w: bad op count %d in batch %d", errUnreadable, count, i)
 		}
-		var ok bool
-		if o.key, p, ok = cutBytes(p[1:], maxKeyLen); !ok || len(o.key) == 0 {
-			return 0, nil, fmt.Errorf("%w: bad key", errUnreadable)
-		}
-		if o.kind == opPut {
-			if o.value, p, ok = cutBytes(p, maxRecord); !ok {
-				return 0, nil, fmt.Errorf("%w: bad value", errUnreadable)
+		ops := make([]op, 0, count)
+		for range count {
+			if len(p) == 0 {
+				return 0, nil, fmt.Errorf("%w: truncated op", errUnreadable)
 			}
+			o := op{kind: p[0]}
+			if o.kind != opPut && o.kind != opDelete {
+				return 0, nil, fmt.Errorf("%w: bad op kind %d", errUnreadable, o.kind)
+			}
+			var ok bool
+			if o.key, p, ok = cutBytes(p[1:], maxKeyLen); !ok || len(o.key) == 0 {
+				return 0, nil, fmt.Errorf("%w: bad key", errUnreadable)
+			}
+			if o.kind == opPut {
+				if o.value, p, ok = cutBytes(p, maxRecord); !ok {
+					return 0, nil, fmt.Errorf("%w: bad value", errUnreadable)
+				}
+			}
+			ops = append(ops, o)
 		}
-		ops = append(ops, o)
+		batches = append(batches, ops)
 	}
 	if len(p) != 0 {
 		return 0, nil, fmt.Errorf("%w: %d trailing payload bytes", errUnreadable, len(p))
 	}
-	return seq, ops, nil
+	return seq, batches, nil
 }
 
 // cutBytes reads a uvarint length (at most limit) and that many bytes from

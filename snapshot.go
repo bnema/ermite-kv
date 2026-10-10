@@ -2,7 +2,10 @@
 
 package kv
 
-import "iter"
+import (
+	"context"
+	"iter"
+)
 
 // Item is the value stored under a key.
 type Item struct {
@@ -29,18 +32,19 @@ func (s *Snapshot) Seq() uint64 { return s.seq }
 // Len returns the number of keys.
 func (s *Snapshot) Len() int { return s.t.len() }
 
-// Get returns the item stored under key.
-func (s *Snapshot) Get(key []byte) (Item, bool) { return s.t.get(key) }
+// Get returns the item stored under key. Reads never block or log: ctx is
+// not checked.
+func (s *Snapshot) Get(_ context.Context, key []byte) (Item, bool) { return s.t.get(key) }
 
 // Range iterates over the keys in [start, end) in ascending order. A nil end
 // (or an empty start) is unbounded. Breaking out of the loop stops the walk.
-func (s *Snapshot) Range(start, end []byte) iter.Seq2[[]byte, Item] {
+func (s *Snapshot) Range(_ context.Context, start, end []byte) iter.Seq2[[]byte, Item] {
 	return s.t.ascend(start, end)
 }
 
 // Prefix iterates over the keys that begin with p in ascending order. An
 // empty p matches every key.
-func (s *Snapshot) Prefix(p []byte) iter.Seq2[[]byte, Item] {
+func (s *Snapshot) Prefix(_ context.Context, p []byte) iter.Seq2[[]byte, Item] {
 	return s.t.ascend(p, prefixEnd(p))
 }
 

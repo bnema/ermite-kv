@@ -4,13 +4,16 @@ package kv
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/bnema/zerowrap"
 
 	"bnema.dev/ermite-kv/internal/fsys"
 	"bnema.dev/ermite-kv/internal/fsys/faultfs"
@@ -44,7 +47,15 @@ func (s *state) apply(seq uint64, ops []op) {
 	}
 }
 
-func recoverState(t *testing.T, fx fsys.FS, logger *slog.Logger) (*state, recovered, error) {
+// noLog is a disabled logger.
+var noLog = zerowrap.FromCtx(context.Background())
+
+// bufLogger returns a JSON logger at debug level writing to buf.
+func bufLogger(buf *bytes.Buffer) zerowrap.Logger {
+	return zerowrap.New(zerowrap.Config{Level: "debug", Format: "json", Output: buf})
+}
+
+func recoverState(t *testing.T, fx fsys.FS, logger zerowrap.Logger) (*state, recovered, error) {
 	t.Helper()
 	s := &state{m: map[string]string{}, versions: map[string]uint64{}}
 	rec, err := recoverDir(fx, testDir, logger, s.load, s.apply)
@@ -55,7 +66,7 @@ func recoverState(t *testing.T, fx fsys.FS, logger *slog.Logger) (*state, recove
 // releases the lock and the log file.
 func mustRecover(t *testing.T, fx fsys.FS) (*state, recovered) {
 	t.Helper()
-	s, rec, err := recoverState(t, fx, nil)
+	s, rec, err := recoverState(t, fx, noLog)
 	if err != nil {
 		t.Fatalf("recoverDir: %v", err)
 	}
@@ -134,12 +145,12 @@ func TestRecoverEmptyDirCreatesLog(t *testing.T) {
 func TestRecoverLockedAndRelease(t *testing.T) {
 	fx := faultfs.New()
 	_, rec := mustRecover(t, fx)
-	if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrLocked) {
+	if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second recover: err = %v, want ErrLocked", err)
 	}
 	_ = rec.log.Close()
 	_ = rec.lock.Close()
-	_, rec2, err := recoverState(t, fx, nil)
+	_, rec2, err := recoverState(t, fx, noLog)
 	if err != nil {
 		t.Fatalf("recover after release: %v", err)
 	}
@@ -150,7 +161,7 @@ func TestRecoverLockedAndRelease(t *testing.T) {
 func TestRecoverReleasesLockOnError(t *testing.T) {
 	fx := faultfs.New()
 	put(fx, logName(0), []byte("garbage"))
-	if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
 	l, err := fx.Lock(filepath.Join(testDir, lockName))
@@ -228,7 +239,7 @@ func TestRecoverTornTail(t *testing.T) {
 			fx := faultfs.New()
 			put(fx, logName(0), append(append([]byte(nil), good...), tail...))
 			var logs bytes.Buffer
-			s, rec, err := recoverState(t, fx, slog.New(slog.NewTextHandler(&logs, nil)))
+			s, rec, err := recoverState(t, fx, bufLogger(&logs))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -270,20 +281,19 @@ func TestRecoverDamageFollowedByValidRecord(t *testing.T) {
 		return c
 	}
 	hdr := appendLogHeader(nil, 0)
-	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 	cases := map[string][]byte{
 		"bad crc in middle record":     cat(hdr, r1, flip(r2, len(r2)-1), r3),
 		"bad payload in first record":  cat(hdr, flip(r1, 9), r2),
 		"bad checksum field":           cat(hdr, r1, flip(r2, 4), r3),
 		"damaged record before last":   cat(hdr, flip(r1, len(r1)-1), r2, r3),
-		"record with wrong count":      cat(hdr, rawRecord(rawPayload(1, 5, opDelete, 1, 'k')), r2),
+		"record with wrong count":      cat(hdr, rawRecord(rawPayload(1, 5, rawBatch(1, opDelete, 1, 'k')...)), r2),
 		"corrupt but len looks intact": cat(hdr, r1, flip(r2, 12), r3),
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
 			fx := faultfs.New()
 			put(fx, logName(0), data)
-			_, _, err := recoverState(t, fx, nil)
+			_, _, err := recoverState(t, fx, noLog)
 			if !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("err = %v, want ErrCorrupt", err)
 			}
@@ -308,7 +318,7 @@ func TestRecoverDamageInOlderLog(t *testing.T) {
 			fx := faultfs.New()
 			put(fx, logName(0), data)
 			put(fx, logName(2), logBytes(2, []op{putOp("c", "3")}))
-			if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrCorrupt) {
+			if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("err = %v, want ErrCorrupt", err)
 			}
 		})
@@ -338,7 +348,7 @@ func TestRecoverBadLogHeader(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fx := faultfs.New()
 			put(fx, c.name, c.data)
-			if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrCorrupt) {
+			if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("err = %v, want ErrCorrupt", err)
 			}
 		})
@@ -347,7 +357,7 @@ func TestRecoverBadLogHeader(t *testing.T) {
 		fx := faultfs.New()
 		put(fx, logName(0), good[:10])
 		put(fx, logName(1), logBytes(1, []op{putOp("b", "2")}))
-		if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrCorrupt) {
+		if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("err = %v, want ErrCorrupt", err)
 		}
 	})
@@ -391,7 +401,7 @@ func TestRecoverSeqGap(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fx := faultfs.New()
 			setup(fx)
-			if _, _, err := recoverState(t, fx, nil); !errors.Is(err, ErrCorrupt) {
+			if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("err = %v, want ErrCorrupt", err)
 			}
 		})
@@ -444,7 +454,7 @@ func TestRecoverInvalidNewestSnapshotFallsBack(t *testing.T) {
 			put(fx, snapshotName(4), bad)
 			put(fx, logName(2), logBytes(2, []op{putOp("c", "3")}, []op{putOp("d", "4")}, []op{delOp("a")}))
 			var logs bytes.Buffer
-			s, rec, err := recoverState(t, fx, slog.New(slog.NewTextHandler(&logs, nil)))
+			s, rec, err := recoverState(t, fx, bufLogger(&logs))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -489,7 +499,7 @@ func TestRecoverSnapshotLoadOrderAndOwnership(t *testing.T) {
 	put(fx, snapshotName(1), snapshotBytes(t, 1, snapEnt("a", "1", 1), snapEnt("b", "2", 1), snapEnt("c", "3", 1)))
 	var keys []string
 	var held [][]byte
-	_, err := recoverDir(fx, testDir, nil, func(k, v []byte, ver uint64) {
+	_, err := recoverDir(fx, testDir, noLog, func(k, v []byte, ver uint64) {
 		keys = append(keys, string(k))
 		held = append(held, k, v)
 	}, nil)
@@ -528,11 +538,11 @@ func TestRecoverOSFilesystem(t *testing.T) {
 	data := logBytes(0, []op{putOp("a", "1")}, []op{putOp("b", "2")})
 	torn := append(append([]byte(nil), data...), 9, 9, 9)
 
-	rec, err := recoverDir(fsys.OS(), dir, nil, nil, nil)
+	rec, err := recoverDir(fsys.OS(), dir, noLog, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recoverDir(fsys.OS(), dir, nil, nil, nil); !errors.Is(err, ErrLocked) {
+	if _, err := recoverDir(fsys.OS(), dir, noLog, nil, nil); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second recover: err = %v, want ErrLocked", err)
 	}
 	if _, err := rec.log.Write(data[logHeaderSize:]); err != nil {
@@ -548,7 +558,7 @@ func TestRecoverOSFilesystem(t *testing.T) {
 	_ = rec.lock.Close()
 
 	s := &state{m: map[string]string{}, versions: map[string]uint64{}}
-	rec, err = recoverDir(fsys.OS(), dir, nil, s.load, s.apply)
+	rec, err = recoverDir(fsys.OS(), dir, noLog, s.load, s.apply)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,5 +571,101 @@ func TestRecoverOSFilesystem(t *testing.T) {
 	n, err := rec.log.ReadAt(buf, 0)
 	if n != len(data) || (err != nil && !errors.Is(err, io.EOF)) {
 		t.Fatalf("ReadAt = %d, %v: tail not truncated", n, err)
+	}
+}
+
+func TestRecoverGroupRecords(t *testing.T) {
+	fx := faultfs.New()
+	b := appendLogHeader(nil, 0)
+	b = appendRecord(b, 1, []op{putOp("a", "1")}, []op{putOp("b", "2"), delOp("a")}, []op{putOp("c", "3")})
+	b = appendRecord(b, 4, []op{putOp("a", "4")})
+	put(fx, logName(0), b)
+	s, rec := mustRecover(t, fx)
+	wantState(t, s, map[string]string{"a": "4", "b": "2", "c": "3"})
+	if got := fmt.Sprint(s.seqs); got != "[1 2 3 4]" {
+		t.Fatalf("applied seqs %s", got)
+	}
+	if s.versions["b"] != 2 || s.versions["c"] != 3 || s.versions["a"] != 4 || rec.lastSeq != 4 {
+		t.Fatalf("versions = %v, rec = %+v", s.versions, rec)
+	}
+}
+
+// TestRecoverRecordStraddlesSnapshot checks that only the batches newer than
+// the snapshot of a record that spans the snapshot seq are replayed.
+func TestRecoverRecordStraddlesSnapshot(t *testing.T) {
+	fx := faultfs.New()
+	put(fx, snapshotName(2), snapshotBytes(t, 2, snapEnt("a", "1", 1), snapEnt("b", "2", 2)))
+	b := appendLogHeader(nil, 0)
+	b = appendRecord(b, 1, []op{putOp("a", "1")}, []op{putOp("b", "2")}, []op{putOp("c", "3")}, []op{delOp("a")})
+	b = appendRecord(b, 5, []op{putOp("d", "5")})
+	put(fx, logName(0), b)
+	s, rec := mustRecover(t, fx)
+	wantState(t, s, map[string]string{"b": "2", "c": "3", "d": "5"})
+	if got := fmt.Sprint(s.seqs); got != "[3 4 5]" {
+		t.Fatalf("applied seqs %s, want [3 4 5]", got)
+	}
+	if rec.snapSeq != 2 || rec.lastSeq != 5 {
+		t.Fatalf("rec = %+v", rec)
+	}
+
+	// A record that ends exactly at the snapshot seq adds nothing.
+	fx = faultfs.New()
+	put(fx, snapshotName(2), snapshotBytes(t, 2, snapEnt("a", "1", 1), snapEnt("b", "2", 2)))
+	put(fx, logName(0), cat(appendLogHeader(nil, 0), appendRecord(nil, 1, []op{putOp("a", "1")}, []op{putOp("b", "2")})))
+	s, rec = mustRecover(t, fx)
+	if len(s.seqs) != 0 || rec.lastSeq != 2 {
+		t.Fatalf("applied %v, rec = %+v", s.seqs, rec)
+	}
+}
+
+func TestRecoverTornGroupRecordFollowedByValidRecord(t *testing.T) {
+	r1 := appendRecord(nil, 1, []op{putOp("a", "1")}, []op{putOp("b", "2")})
+	r2 := appendRecord(nil, 3, []op{putOp("c", "3")}, []op{putOp("d", "4")})
+	r3 := appendRecord(nil, 5, []op{putOp("e", "5")})
+	damaged := slices.Clone(r2)
+	damaged[len(damaged)/2] ^= 0xff
+	fx := faultfs.New()
+	data := cat(appendLogHeader(nil, 0), r1, damaged, r3)
+	put(fx, logName(0), data)
+	if _, _, err := recoverState(t, fx, noLog); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+	if got, _ := fx.ReadFile(filepath.Join(testDir, logName(0))); !bytes.Equal(got, data) {
+		t.Fatal("corrupt log was modified")
+	}
+
+	// Without a readable record after it, the same damage is a torn tail
+	// that drops the whole group record, and nothing of it is applied.
+	fx = faultfs.New()
+	put(fx, logName(0), cat(appendLogHeader(nil, 0), r1, damaged))
+	s, rec := mustRecover(t, fx)
+	wantState(t, s, map[string]string{"a": "1", "b": "2"})
+	if rec.lastSeq != 2 {
+		t.Fatalf("rec = %+v", rec)
+	}
+}
+
+// TestRecoverDamagedLenIsTornTail checks that a damaged len field of the last
+// record is handled as a torn tail: the record is dropped.
+func TestRecoverDamagedLenIsTornTail(t *testing.T) {
+	good := logBytes(0, []op{putOp("a", "1")})
+	r2 := appendRecord(nil, 2, []op{putOp("b", "2")})
+	for name, patch := range map[string]func(b []byte){
+		"len beyond EOF":  func(b []byte) { b[1] = 0x7f },
+		"len above max":   func(b []byte) { b[3] = 0x7f },
+		"len below min":   func(b []byte) { clear(b[:4]) },
+		"len off by some": func(b []byte) { b[0] += 3 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := slices.Clone(r2)
+			patch(bad)
+			fx := faultfs.New()
+			put(fx, logName(0), cat(good, bad))
+			s, rec := mustRecover(t, fx)
+			wantState(t, s, map[string]string{"a": "1"})
+			if rec.lastSeq != 1 || rec.logSize != int64(len(good)) {
+				t.Fatalf("rec = %+v", rec)
+			}
+		})
 	}
 }

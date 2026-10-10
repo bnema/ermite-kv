@@ -135,18 +135,18 @@ func checkAgainst(t *testing.T, rng *rand.Rand, tr tree, m model, genKey func() 
 			}
 		}
 	}
-	verify("full scan", collect(s.Range(nil, nil)), nil, nil)
+	verify("full scan", collect(s.Range(bg, nil, nil)), nil, nil)
 
 	for range 20 {
 		k := genKey()
-		got, ok := s.Get(k)
+		got, ok := s.Get(bg, k)
 		want, wok := m[string(k)]
 		if ok != wok || (ok && !equalItem(got, want)) {
 			t.Fatalf("Get(%x) = %v,%v want %v,%v", k, got, ok, want, wok)
 		}
 	}
 	for k, want := range m {
-		if got, ok := s.Get([]byte(k)); !ok || !equalItem(got, want) {
+		if got, ok := s.Get(bg, []byte(k)); !ok || !equalItem(got, want) {
 			t.Fatalf("Get(%x) = %v,%v want %v", k, got, ok, want)
 		}
 		break // one arbitrary present key is enough per check
@@ -156,9 +156,9 @@ func checkAgainst(t *testing.T, rng *rand.Rand, tr tree, m model, genKey func() 
 		if bytes.Compare(a, b) > 0 {
 			a, b = b, a
 		}
-		verify("range", collect(s.Range(a, b)), a, b)
-		verify("range open end", collect(s.Range(a, nil)), a, nil)
-		verify("range open start", collect(s.Range(nil, b)), nil, b)
+		verify("range", collect(s.Range(bg, a, b)), a, b)
+		verify("range open end", collect(s.Range(bg, a, nil)), a, nil)
+		verify("range open start", collect(s.Range(bg, nil, b)), nil, b)
 	}
 	for range 10 {
 		p := genKey()
@@ -169,7 +169,7 @@ func checkAgainst(t *testing.T, rng *rand.Rand, tr tree, m model, genKey func() 
 				want = append(want, k)
 			}
 		}
-		got := collect(s.Prefix(p))
+		got := collect(s.Prefix(bg, p))
 		if len(got) != len(want) {
 			t.Fatalf("prefix %x: got %d items, want %d", p, len(got), len(want))
 		}
@@ -181,7 +181,7 @@ func checkAgainst(t *testing.T, rng *rand.Rand, tr tree, m model, genKey func() 
 	}
 	// Early break stops the walk.
 	seen := 0
-	for range s.Range(nil, nil) {
+	for range s.Range(bg, nil, nil) {
 		seen++
 		if seen == 3 {
 			break
@@ -355,10 +355,10 @@ func TestPrefixAllFF(t *testing.T) {
 		tr = tr.put(k, nil, uint64(i+1))
 	}
 	s := newSnapshot(tr, 4)
-	if got := collect(s.Prefix([]byte{0xFF})); len(got) != 3 {
+	if got := collect(s.Prefix(bg, []byte{0xFF})); len(got) != 3 {
 		t.Fatalf("prefix FF: %d items, want 3", len(got))
 	}
-	if got := collect(s.Prefix(nil)); len(got) != 4 {
+	if got := collect(s.Prefix(bg, nil)); len(got) != 4 {
 		t.Fatalf("empty prefix: %d items, want 4", len(got))
 	}
 }
@@ -378,7 +378,7 @@ func BenchmarkSnapshotGet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
-		if _, ok := s.Get(keys[(i*7919)%len(keys)]); !ok {
+		if _, ok := s.Get(bg, keys[(i*7919)%len(keys)]); !ok {
 			b.Fatal("missing key")
 		}
 	}
@@ -389,7 +389,7 @@ func BenchmarkRange(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		n := 0
-		for range s.Range(nil, nil) {
+		for range s.Range(bg, nil, nil) {
 			n++
 		}
 		if n != 100_000 {
@@ -470,7 +470,7 @@ func TestConcurrentReaders(t *testing.T) {
 				s := cur.Load()
 				n := 0
 				var prev []byte
-				for k, it := range s.Range(nil, nil) {
+				for k, it := range s.Range(bg, nil, nil) {
 					if prev != nil && bytes.Compare(prev, k) >= 0 {
 						t.Errorf("seq %d: keys out of order", s.Seq())
 						return
