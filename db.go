@@ -242,6 +242,11 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 	return res.seq, res.err
 }
 
+// Err reports why the database stopped: ErrClosed after Close, ErrFailed
+// (wrapped as Apply returns it) after a fatal write error, nil while it runs.
+// It does not touch the writer.
+func (db *DB) Err() error { return db.stopped() }
+
 // stopped returns the failure (which wins over Close, so callers see a
 // stable error), ErrClosed, or nil while the database accepts batches.
 func (db *DB) stopped() error {

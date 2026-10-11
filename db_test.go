@@ -1181,3 +1181,43 @@ func BenchmarkApply(b *testing.B) {
 	b.ReportMetric(syncs/secs, "syncs/s")
 	b.ReportMetric(float64(b.N)/syncs, "batches/sync")
 }
+
+func TestErr(t *testing.T) {
+	tests := []struct {
+		name string
+		stop func(t *testing.T, db *DB, fx *faultfs.FS)
+		want error
+	}{
+		{"running", func(*testing.T, *DB, *faultfs.FS) {}, nil},
+		{"closed", func(t *testing.T, db *DB, _ *faultfs.FS) {
+			if err := db.Close(bg); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		}, ErrClosed},
+		{"failed", func(t *testing.T, db *DB, fx *faultfs.FS) {
+			fx.FailWrite(1, nil)
+			var b Batch
+			b.Put([]byte("k"), []byte("v"))
+			if _, err := db.Apply(bg, &b); !errors.Is(err, ErrFailed) {
+				t.Fatalf("Apply: %v, want ErrFailed", err)
+			}
+		}, ErrFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := faultfs.New()
+			db := mustOpen(t, fx, Options{})
+			tt.stop(t, db, fx)
+			err := db.Err()
+			if tt.want == nil {
+				if err != nil {
+					t.Fatalf("Err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Err = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
