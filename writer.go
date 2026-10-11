@@ -5,7 +5,6 @@ package kv
 import (
 	"fmt"
 	"io"
-	"sync"
 	"time"
 )
 
@@ -14,7 +13,9 @@ import (
 const maxGroupBytes = 4 << 20
 
 // request is a batch waiting for the writer. The writer answers on reply
-// exactly once.
+// exactly once. Requests are allocated per Apply and never pooled: a pooled
+// channel would be shared across testing/synctest bubbles, and receiving on a
+// bubbled channel from outside its bubble is fatal.
 type request struct {
 	b     *Batch
 	reply chan result // capacity 1
@@ -23,18 +24,6 @@ type request struct {
 type result struct {
 	seq uint64
 	err error
-}
-
-var requestPool = sync.Pool{New: func() any {
-	return &request{reply: make(chan result, 1)}
-}}
-
-// release returns r to the pool (it must not be referenced by the writer)
-// and passes err through.
-func (r *request) release(err error) error {
-	r.b = nil
-	requestPool.Put(r)
-	return err
 }
 
 // writer is the single goroutine that owns the log file and builds the new

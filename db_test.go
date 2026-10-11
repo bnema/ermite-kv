@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/bnema/zerowrap"
@@ -354,7 +355,9 @@ func TestPreconditionsBeforeOps(t *testing.T) {
 // holdWriter applies a batch whose sync is slow and returns once the writer
 // is inside that sync, so batches applied next queue up and form one group
 // (GroupWindow 0 drains everything already queued). wait returns when the
-// held batch is acknowledged; the sync delay stays set until then.
+// held batch is acknowledged; the sync delay stays set until then. It must be
+// called inside a synctest bubble: the writer sleeps in the sync on the fake
+// clock, so no real time passes.
 func holdWriter(t *testing.T, db *DB, fx *faultfs.FS) (wait func()) {
 	t.Helper()
 	base := fx.Syncs()
@@ -366,8 +369,9 @@ func holdWriter(t *testing.T, db *DB, fx *faultfs.FS) (wait func()) {
 		_, err := db.Apply(bg, &b)
 		done <- err
 	}()
-	for fx.Syncs() == base {
-		time.Sleep(time.Millisecond)
+	synctest.Wait() // the writer is parked in the delayed sync
+	if fx.Syncs() == base {
+		t.Fatal("the writer did not reach the sync")
 	}
 	return func() {
 		t.Helper()
@@ -381,28 +385,30 @@ func holdWriter(t *testing.T, db *DB, fx *faultfs.FS) (wait func()) {
 // TestGroupPreconditions checks that preconditions see earlier batches of
 // the same group: the second batch of the group must conflict.
 func TestGroupPreconditions(t *testing.T) {
-	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{})
-	syncs := fx.Syncs()
-	wait := holdWriter(t, db, fx)
-	errs := make([]error, 2)
-	var wg sync.WaitGroup
-	for i := range errs {
-		wg.Go(func() {
-			var b Batch
-			b.RequireAbsent([]byte("k"))
-			b.Put([]byte("k"), []byte{byte('a' + i)})
-			_, errs[i] = db.Apply(bg, &b)
-		})
-	}
-	wg.Wait()
-	wait()
-	if (errs[0] == nil) == (errs[1] == nil) {
-		t.Fatalf("errors %v, want exactly one success", errs)
-	}
-	if got := fx.Syncs() - syncs; got != 2 {
-		t.Fatalf("%d syncs, want 2 (held batch, then one group)", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{})
+		syncs := fx.Syncs()
+		wait := holdWriter(t, db, fx)
+		errs := make([]error, 2)
+		var wg sync.WaitGroup
+		for i := range errs {
+			wg.Go(func() {
+				var b Batch
+				b.RequireAbsent([]byte("k"))
+				b.Put([]byte("k"), []byte{byte('a' + i)})
+				_, errs[i] = db.Apply(bg, &b)
+			})
+		}
+		wg.Wait()
+		wait()
+		if (errs[0] == nil) == (errs[1] == nil) {
+			t.Fatalf("errors %v, want exactly one success", errs)
+		}
+		if got := fx.Syncs() - syncs; got != 2 {
+			t.Fatalf("%d syncs, want 2 (held batch, then one group)", got)
+		}
+	})
 }
 
 func TestEmptyAndConflictOnlyBatches(t *testing.T) {
@@ -462,25 +468,27 @@ func TestEmptyAndConflictOnlyBatches(t *testing.T) {
 // TestNoWriteForSkippedGroup checks that a group of only conflicts and empty
 // batches neither writes nor syncs.
 func TestNoWriteForSkippedGroup(t *testing.T) {
-	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{GroupWindow: 100 * time.Millisecond})
-	putKV(t, db, "a", "1")
-	writes, syncs := fx.Writes(), fx.Syncs()
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() {
-			var b Batch
-			b.RequireAbsent([]byte("a"))
-			b.Put([]byte("x"), nil)
-			if _, err := db.Apply(bg, &b); !errors.Is(err, ErrConflict) {
-				t.Errorf("err = %v, want ErrConflict", err)
-			}
-		})
-	}
-	wg.Wait()
-	if fx.Writes() != writes || fx.Syncs() != syncs {
-		t.Fatalf("writes %d→%d syncs %d→%d", writes, fx.Writes(), syncs, fx.Syncs())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{GroupWindow: 100 * time.Millisecond})
+		putKV(t, db, "a", "1")
+		writes, syncs := fx.Writes(), fx.Syncs()
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				var b Batch
+				b.RequireAbsent([]byte("a"))
+				b.Put([]byte("x"), nil)
+				if _, err := db.Apply(bg, &b); !errors.Is(err, ErrConflict) {
+					t.Errorf("err = %v, want ErrConflict", err)
+				}
+			})
+		}
+		wg.Wait()
+		if fx.Writes() != writes || fx.Syncs() != syncs {
+			t.Fatalf("writes %d→%d syncs %d→%d", writes, fx.Writes(), syncs, fx.Syncs())
+		}
+	})
 }
 
 func TestGroupCommitSyncs(t *testing.T) {
@@ -527,33 +535,35 @@ func TestNoSync(t *testing.T) {
 // TestLargeBatches covers a batch above the 4 MiB group cap (a group of one)
 // and a burst of batches that does not fit in one group.
 func TestLargeBatches(t *testing.T) {
-	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{GroupWindow: 50 * time.Millisecond})
-	big := strings.Repeat("B", 5<<20)
-	putKV(t, db, "big", big)
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{GroupWindow: 50 * time.Millisecond})
+		big := strings.Repeat("B", 5<<20)
+		putKV(t, db, "big", big)
 
-	const n = 6
-	chunk := strings.Repeat("c", 3<<19) // 1.5 MiB: three do not fit in 4 MiB
-	seqs := make([]uint64, n)
-	var wg sync.WaitGroup
-	for i := range n {
-		wg.Go(func() { seqs[i] = putKV(t, db, fmt.Sprintf("chunk%d", i), chunk) })
-	}
-	wg.Wait()
-	slices.Sort(seqs)
-	for i, s := range seqs {
-		if s != uint64(i+2) {
-			t.Fatalf("seqs = %v", seqs)
+		const n = 6
+		chunk := strings.Repeat("c", 3<<19) // 1.5 MiB: three do not fit in 4 MiB
+		seqs := make([]uint64, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() { seqs[i] = putKV(t, db, fmt.Sprintf("chunk%d", i), chunk) })
 		}
-	}
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	s := mustOpen(t, fx, Options{}).Snapshot(bg)
-	mustGet(t, s, "big", big)
-	for i := range n {
-		mustGet(t, s, fmt.Sprintf("chunk%d", i), chunk)
-	}
+		wg.Wait()
+		slices.Sort(seqs)
+		for i, s := range seqs {
+			if s != uint64(i+2) {
+				t.Fatalf("seqs = %v", seqs)
+			}
+		}
+		if err := db.Close(bg); err != nil {
+			t.Fatal(err)
+		}
+		s := mustOpen(t, fx, Options{}).Snapshot(bg)
+		mustGet(t, s, "big", big)
+		for i := range n {
+			mustGet(t, s, fmt.Sprintf("chunk%d", i), chunk)
+		}
+	})
 }
 
 func TestInvalidInputs(t *testing.T) {
@@ -675,58 +685,65 @@ func TestApplyAfterClose(t *testing.T) {
 // TestContextBeforeDequeue blocks the writer in a slow sync so that a second
 // batch cannot be dequeued, then cancels its context.
 func TestContextBeforeDequeue(t *testing.T) {
-	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{})
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{})
 
-	done := make(chan error, 1)
-	base := fx.Syncs()
-	fx.SetSyncDelay(300 * time.Millisecond)
-	go func() {
+		done := make(chan error, 1)
+		base := fx.Syncs()
+		fx.SetSyncDelay(300 * time.Millisecond)
+		go func() {
+			var b Batch
+			b.Put([]byte("first"), []byte("1"))
+			_, err := db.Apply(bg, &b)
+			done <- err
+		}()
+		synctest.Wait() // the writer is now inside the delayed sync
+		if fx.Syncs() == base {
+			t.Fatal("the writer did not reach the sync")
+		}
+		start := time.Now()
+
+		ctx, cancel := context.WithCancel(bg)
+		second := make(chan error, 1)
+		go func() {
+			var b Batch
+			b.Put([]byte("second"), []byte("2"))
+			_, err := db.Apply(ctx, &b)
+			second <- err
+		}()
+		synctest.Wait() // Apply is blocked in its select: the writer cannot dequeue
+		cancel()
+		if err := <-second; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Apply = %v, want context.Canceled", err)
+		}
+		if d := time.Since(start); d != 0 {
+			t.Fatalf("the cancelled Apply returned after %v, it must not wait for the sync", d)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("first Apply: %v", err)
+		}
+		fx.SetSyncDelay(0)
+
+		// An already cancelled context never reaches the writer either.
 		var b Batch
-		b.Put([]byte("first"), []byte("1"))
-		_, err := db.Apply(bg, &b)
-		done <- err
-	}()
-	for fx.Syncs() == base { // the writer is now inside the delayed sync
-		time.Sleep(time.Millisecond)
-	}
-
-	ctx, cancel := context.WithCancel(bg)
-	second := make(chan error, 1)
-	go func() {
-		var b Batch
-		b.Put([]byte("second"), []byte("2"))
-		_, err := db.Apply(ctx, &b)
-		second <- err
-	}()
-	time.Sleep(50 * time.Millisecond) // let Apply reach its blocking select
-	cancel()
-	if err := <-second; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Apply = %v, want context.Canceled", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("first Apply: %v", err)
-	}
-	fx.SetSyncDelay(0)
-
-	// An already cancelled context never reaches the writer either.
-	var b Batch
-	b.Put([]byte("third"), nil)
-	if _, err := db.Apply(ctx, &b); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Apply with cancelled ctx = %v", err)
-	}
-	putKV(t, db, "fourth", "4") // the writer is still healthy
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	s := mustOpen(t, fx, Options{}).Snapshot(bg)
-	mustGet(t, s, "first", "1")
-	mustGet(t, s, "fourth", "4")
-	mustMissing(t, s, "second")
-	mustMissing(t, s, "third")
-	if s.Seq() != 2 {
-		t.Fatalf("Seq = %d, want 2", s.Seq())
-	}
+		b.Put([]byte("third"), nil)
+		if _, err := db.Apply(ctx, &b); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Apply with cancelled ctx = %v", err)
+		}
+		putKV(t, db, "fourth", "4") // the writer is still healthy
+		if err := db.Close(bg); err != nil {
+			t.Fatal(err)
+		}
+		s := mustOpen(t, fx, Options{}).Snapshot(bg)
+		mustGet(t, s, "first", "1")
+		mustGet(t, s, "fourth", "4")
+		mustMissing(t, s, "second")
+		mustMissing(t, s, "third")
+		if s.Seq() != 2 {
+			t.Fatalf("Seq = %d, want 2", s.Seq())
+		}
+	})
 }
 
 func TestCloseDuringApplies(t *testing.T) {
@@ -804,7 +821,7 @@ func TestInjectedFailures(t *testing.T) {
 	for _, f := range failures {
 		for _, powerLoss := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/powerloss=%v", f.name, powerLoss), func(t *testing.T) {
-				testInjectedFailure(t, f, powerLoss)
+				synctest.Test(t, func(t *testing.T) { testInjectedFailure(t, f, powerLoss) })
 			})
 		}
 	}
@@ -894,25 +911,27 @@ func testInjectedFailure(t *testing.T, f failure, powerLoss bool) {
 // TestFailedWriterAnswersOverflow checks that no Apply hangs when the group
 // that fails leaves a dequeued request behind.
 func TestFailedWriterAnswersOverflow(t *testing.T) {
-	fx := faultfs.New()
-	db := mustOpen(t, fx, Options{GroupWindow: 100 * time.Millisecond})
-	fx.FailWrite(1, nil)
-	chunk := strings.Repeat("c", 3<<20) // two do not fit in one group
-	errs := make([]error, 4)
-	var wg sync.WaitGroup
-	for i := range errs {
-		wg.Go(func() {
-			var b Batch
-			b.Put(fmt.Appendf(nil, "k%d", i), []byte(chunk))
-			_, errs[i] = db.Apply(bg, &b)
-		})
-	}
-	wg.Wait()
-	for i, err := range errs {
-		if !errors.Is(err, ErrFailed) {
-			t.Errorf("batch %d: %v", i, err)
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{GroupWindow: 100 * time.Millisecond})
+		fx.FailWrite(1, nil)
+		chunk := strings.Repeat("c", 3<<20) // two do not fit in one group
+		errs := make([]error, 4)
+		var wg sync.WaitGroup
+		for i := range errs {
+			wg.Go(func() {
+				var b Batch
+				b.Put(fmt.Appendf(nil, "k%d", i), []byte(chunk))
+				_, errs[i] = db.Apply(bg, &b)
+			})
 		}
-	}
+		wg.Wait()
+		for i, err := range errs {
+			if !errors.Is(err, ErrFailed) {
+				t.Errorf("batch %d: %v", i, err)
+			}
+		}
+	})
 }
 
 type syncBuffer struct {

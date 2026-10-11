@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/bnema/zerowrap"
@@ -239,14 +240,34 @@ func settled(t testing.TB, fx fsys.FS, s uint64) bool {
 	return slices.Equal(snaps, []uint64{s}) && slices.Equal(logs, []uint64{s})
 }
 
-func waitFor(t testing.TB, what string, cond func() bool) {
+// settle returns once every goroutine of the bubble is durably blocked: the
+// writer and any compactor have finished all the work they can do. It must be
+// called inside a synctest bubble.
+func settle() { synctest.Wait() }
+
+// applyUntil applies batches i, i+1, … until cond holds, settling after each
+// one so that a compaction the batch triggered has finished. It returns the
+// next unused i.
+func applyUntil(t testing.TB, db *DB, i int, what string, cond func() bool) int {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timeout waiting for %s", what)
+	settle()
+	for ; !cond(); i++ {
+		if i > 1000 {
+			t.Fatalf("%s did not happen", what)
 		}
-		time.Sleep(time.Millisecond)
+		mustApply(t, db, i)
+		settle()
+	}
+	return i
+}
+
+// failedDB reports whether the database is in the failed state.
+func failedDB(db *DB) bool {
+	select {
+	case <-db.failed:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -262,43 +283,48 @@ func logged(buf *syncBuffer, msg string) int {
 }
 
 func TestCompactTrigger(t *testing.T) {
-	fx := faultfs.New()
-	ctx, logs := debugCtx()
-	db := mustOpenCtx(t, ctx, fx, compactOpts())
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		ctx, logs := debugCtx()
+		db := mustOpenCtx(t, ctx, fx, compactOpts())
 
-	// Exactly CompactAfter bytes after the header: not above the threshold.
-	for i := 1; i <= 5; i++ {
-		mustApply(t, db, i)
-	}
-	barrier(t, db)
-	if snaps, files := listFiles(t, fx); len(snaps) != 0 || !slices.Equal(files, []uint64{0}) {
-		t.Fatalf("below the threshold: snapshots %v, logs %v", snaps, files)
-	}
-
-	mustApply(t, db, 6)
-	waitFor(t, "compaction", func() bool { return logged(logs, "compaction done") == 1 })
-	if !settled(t, fx, 6) {
-		snaps, files := listFiles(t, fx)
-		t.Fatalf("after compaction: snapshots %v, logs %v; want snapshot-6 and log-6 only", snaps, files)
-	}
-	if n := logged(logs, "log switch"); n != 1 {
-		t.Fatalf("%d log switch messages, want 1", n)
-	}
-	for _, key := range []string{`"seq":6`, `"keys":6`, `"bytes":`, `"duration":`} {
-		if !strings.Contains(logs.String(), key) {
-			t.Errorf("compaction message lacks %s: %s", key, logs.String())
+		// Exactly CompactAfter bytes after the header: not above the threshold.
+		for i := 1; i <= 5; i++ {
+			mustApply(t, db, i)
 		}
-	}
+		barrier(t, db)
+		if snaps, files := listFiles(t, fx); len(snaps) != 0 || !slices.Equal(files, []uint64{0}) {
+			t.Fatalf("below the threshold: snapshots %v, logs %v", snaps, files)
+		}
 
-	// The new log takes the following batches; the old files stay gone.
-	mustApply(t, db, 7)
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	db = mustOpen(t, fx, Options{})
-	if n := mustCheck(t, db, 7); n != 7 {
-		t.Fatalf("recovered %d batches, want 7", n)
-	}
+		mustApply(t, db, 6)
+		settle() // compaction: the background work has finished
+		if logged(logs, "compaction done") != 1 {
+			t.Fatalf("compaction did not happen: %s", logs.String())
+		}
+		if !settled(t, fx, 6) {
+			snaps, files := listFiles(t, fx)
+			t.Fatalf("after compaction: snapshots %v, logs %v; want snapshot-6 and log-6 only", snaps, files)
+		}
+		if n := logged(logs, "log switch"); n != 1 {
+			t.Fatalf("%d log switch messages, want 1", n)
+		}
+		for _, key := range []string{`"seq":6`, `"keys":6`, `"bytes":`, `"duration":`} {
+			if !strings.Contains(logs.String(), key) {
+				t.Errorf("compaction message lacks %s: %s", key, logs.String())
+			}
+		}
+
+		// The new log takes the following batches; the old files stay gone.
+		mustApply(t, db, 7)
+		if err := db.Close(bg); err != nil {
+			t.Fatal(err)
+		}
+		db = mustOpen(t, fx, Options{})
+		if n := mustCheck(t, db, 7); n != 7 {
+			t.Fatalf("recovered %d batches, want 7", n)
+		}
+	})
 }
 
 func TestCompactDisabled(t *testing.T) {
@@ -314,63 +340,62 @@ func TestCompactDisabled(t *testing.T) {
 }
 
 func TestCompactSingleFlight(t *testing.T) {
-	fx := faultfs.New()
-	started, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	h := &hookFS{FS: fx, hook: func(op, path string) error {
-		if op == "open" && strings.Contains(path, snapshotPrefix) {
-			once.Do(func() { close(started); <-release })
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		started, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		h := &hookFS{FS: fx, hook: func(op, path string) error {
+			if op == "open" && strings.Contains(path, snapshotPrefix) {
+				once.Do(func() { close(started); <-release })
+			}
+			return nil
+		}}
+		ctx, logs := debugCtx()
+		db := mustOpenCtx(t, ctx, h, compactOpts())
+		for i := 1; i <= 6; i++ {
+			mustApply(t, db, i)
 		}
-		return nil
-	}}
-	ctx, logs := debugCtx()
-	db := mustOpenCtx(t, ctx, h, compactOpts())
-	for i := 1; i <= 6; i++ {
-		mustApply(t, db, i)
-	}
-	select {
-	case <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the compactor did not start")
-	}
-
-	// The compactor is stuck. The writer is not: it goes on far past the
-	// threshold without starting a second compaction.
-	for i := 7; i <= 60; i++ {
-		mustApply(t, db, i)
-	}
-	barrier(t, db)
-	if snaps, files := listFiles(t, fx); len(snaps) != 0 || !slices.Equal(files, []uint64{0, 6}) {
-		t.Fatalf("while compacting: snapshots %v, logs %v", snaps, files)
-	}
-	if n := logged(logs, "log switch"); n != 1 {
-		t.Fatalf("%d log switches while a compaction was running, want 1", n)
-	}
-
-	close(release)
-	waitFor(t, "first compaction", func() bool { return logged(logs, "compaction done") == 1 })
-	// The log is still over the threshold: the next commit compacts again.
-	i := 61
-	waitFor(t, "second compaction", func() bool {
-		if logged(logs, "compaction done") >= 2 {
-			return true
+		settle() // the compactor is parked in the hook
+		select {
+		case <-started:
+		default:
+			t.Fatal("the compactor did not start")
 		}
-		mustApply(t, db, i)
-		i++
-		return false
+
+		// The compactor is stuck. The writer is not: it goes on far past the
+		// threshold without starting a second compaction.
+		for i := 7; i <= 60; i++ {
+			mustApply(t, db, i)
+		}
+		barrier(t, db)
+		if snaps, files := listFiles(t, fx); len(snaps) != 0 || !slices.Equal(files, []uint64{0, 6}) {
+			t.Fatalf("while compacting: snapshots %v, logs %v", snaps, files)
+		}
+		if n := logged(logs, "log switch"); n != 1 {
+			t.Fatalf("%d log switches while a compaction was running, want 1", n)
+		}
+
+		close(release)
+		settle() // first compaction: the background work has finished
+		if logged(logs, "compaction done") != 1 {
+			t.Fatalf("first compaction did not happen: %s", logs.String())
+		}
+		// The log is still over the threshold: the next commit compacts again.
+		i := 61
+		i = applyUntil(t, db, i, "second compaction", func() bool { return logged(logs, "compaction done") >= 2 })
+		if n := logged(logs, "log switch"); n != 2 {
+			t.Fatalf("%d log switches, want 2", n)
+		}
+		if err := db.Close(bg); err != nil {
+			t.Fatal(err)
+		}
+		snaps, files := listFiles(t, fx)
+		if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
+			t.Fatalf("after the second compaction: snapshots %v, logs %v", snaps, files)
+		}
+		db = mustOpen(t, fx, Options{})
+		mustCheck(t, db, i-1)
 	})
-	if n := logged(logs, "log switch"); n != 2 {
-		t.Fatalf("%d log switches, want 2", n)
-	}
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	snaps, files := listFiles(t, fx)
-	if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
-		t.Fatalf("after the second compaction: snapshots %v, logs %v", snaps, files)
-	}
-	db = mustOpen(t, fx, Options{})
-	mustCheck(t, db, i-1)
 }
 
 func TestCompactRemovesOldFiles(t *testing.T) {
@@ -460,76 +485,72 @@ var compactorFaults = []struct {
 func TestCompactorFailure(t *testing.T) {
 	for _, f := range compactorFaults {
 		t.Run(f.name, func(t *testing.T) {
-			fx := faultfs.New()
-			ctx, logs := debugCtx()
-			db := mustOpenCtx(t, ctx, fx, compactOpts())
-			for i := 1; i <= 5; i++ {
-				mustApply(t, db, i)
-			}
-			f.inject(fx)
-			mustApply(t, db, 6)
-			waitFor(t, "compaction failure", func() bool { return logged(logs, "compaction failed") == 1 })
-			if !strings.Contains(logs.String(), `"level":"warn"`) {
-				t.Errorf("failure not logged as a warning: %s", logs.String())
-			}
-			mustApply(t, db, 7) // the database is not failed
-			if err := db.Close(bg); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
-
-			// Reopen the partial state: it recovers and compacts again.
-			ctx, logs = debugCtx()
-			db = mustOpenCtx(t, ctx, fx, compactOpts())
-			mustCheck(t, db, 7)
-			i := 8
-			waitFor(t, "retried compaction", func() bool {
-				if logged(logs, "compaction done") >= 1 {
-					return true
+			synctest.Test(t, func(t *testing.T) {
+				fx := faultfs.New()
+				ctx, logs := debugCtx()
+				db := mustOpenCtx(t, ctx, fx, compactOpts())
+				for i := 1; i <= 5; i++ {
+					mustApply(t, db, i)
 				}
-				mustApply(t, db, i)
-				i++
-				return false
+				f.inject(fx)
+				mustApply(t, db, 6)
+				settle() // compaction failure: the background work has finished
+				if logged(logs, "compaction failed") != 1 {
+					t.Fatalf("compaction failure did not happen: %s", logs.String())
+				}
+				if !strings.Contains(logs.String(), `"level":"warn"`) {
+					t.Errorf("failure not logged as a warning: %s", logs.String())
+				}
+				mustApply(t, db, 7) // the database is not failed
+				if err := db.Close(bg); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+
+				// Reopen the partial state: it recovers and compacts again.
+				ctx, logs = debugCtx()
+				db = mustOpenCtx(t, ctx, fx, compactOpts())
+				mustCheck(t, db, 7)
+				i := 8
+				i = applyUntil(t, db, i, "retried compaction", func() bool { return logged(logs, "compaction done") >= 1 })
+				if err := db.Close(bg); err != nil {
+					t.Fatal(err)
+				}
+				snaps, files := listFiles(t, fx)
+				if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
+					t.Fatalf("after the retry: snapshots %v, logs %v", snaps, files)
+				}
+				db = mustOpen(t, fx, Options{})
+				mustCheck(t, db, i-1)
 			})
-			if err := db.Close(bg); err != nil {
-				t.Fatal(err)
-			}
-			snaps, files := listFiles(t, fx)
-			if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
-				t.Fatalf("after the retry: snapshots %v, logs %v", snaps, files)
-			}
-			db = mustOpen(t, fx, Options{})
-			mustCheck(t, db, i-1)
 		})
 	}
 }
 
 // TestCompactorRetryWithoutReopen checks the retry in the same process.
 func TestCompactorRetryWithoutReopen(t *testing.T) {
-	fx := faultfs.New()
-	ctx, logs := debugCtx()
-	db := mustOpenCtx(t, ctx, fx, compactOpts())
-	for i := 1; i <= 5; i++ {
-		mustApply(t, db, i)
-	}
-	fx.FailOp(faultfs.OpRename, 2, nil) // the snapshot
-	mustApply(t, db, 6)
-	waitFor(t, "compaction failure", func() bool { return logged(logs, "compaction failed") == 1 })
-	i := 7
-	waitFor(t, "retried compaction", func() bool {
-		if logged(logs, "compaction done") >= 1 {
-			return true
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		ctx, logs := debugCtx()
+		db := mustOpenCtx(t, ctx, fx, compactOpts())
+		for i := 1; i <= 5; i++ {
+			mustApply(t, db, i)
 		}
-		mustApply(t, db, i)
-		i++
-		return false
+		fx.FailOp(faultfs.OpRename, 2, nil) // the snapshot
+		mustApply(t, db, 6)
+		settle() // compaction failure: the background work has finished
+		if logged(logs, "compaction failed") != 1 {
+			t.Fatalf("compaction failure did not happen: %s", logs.String())
+		}
+		i := 7
+		i = applyUntil(t, db, i, "retried compaction", func() bool { return logged(logs, "compaction done") >= 1 })
+		if err := db.Close(bg); err != nil {
+			t.Fatal(err)
+		}
+		snaps, files := listFiles(t, fx)
+		if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
+			t.Fatalf("snapshots %v, logs %v", snaps, files)
+		}
 	})
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	snaps, files := listFiles(t, fx)
-	if len(snaps) != 1 || !slices.Equal(files, snaps) || snaps[0] <= 6 {
-		t.Fatalf("snapshots %v, logs %v", snaps, files)
-	}
 }
 
 // switchFaults fail the creation of log-6 in the writer. The numbering is
@@ -551,49 +572,44 @@ var switchFaults = []struct {
 func TestLogSwitchFailure(t *testing.T) {
 	for _, f := range switchFaults {
 		t.Run(f.name, func(t *testing.T) {
-			fx := faultfs.New()
-			ctx, logs := debugCtx()
-			db := mustOpenCtx(t, ctx, fx, compactOpts())
-			for i := 1; i <= 5; i++ {
-				mustApply(t, db, i)
-			}
-			f.inject(fx)
-			mustApply(t, db, 6)
-			barrier(t, db)
-			if logged(logs, "log switch failed") != 1 {
-				t.Fatalf("switch failure not logged: %s", logs.String())
-			}
-			snaps, files := listFiles(t, fx)
-			if len(snaps) != 0 || !slices.Equal(files, []uint64{0}) {
-				t.Fatalf("after the failure: snapshots %v, logs %v", snaps, files)
-			}
-			names, _ := fx.ReadDir(testDir)
-			for _, n := range names {
-				if strings.HasSuffix(n, tmpSuffix) {
-					t.Errorf("leftover %s", n)
+			synctest.Test(t, func(t *testing.T) {
+				fx := faultfs.New()
+				ctx, logs := debugCtx()
+				db := mustOpenCtx(t, ctx, fx, compactOpts())
+				for i := 1; i <= 5; i++ {
+					mustApply(t, db, i)
 				}
-			}
+				f.inject(fx)
+				mustApply(t, db, 6)
+				barrier(t, db)
+				if logged(logs, "log switch failed") != 1 {
+					t.Fatalf("switch failure not logged: %s", logs.String())
+				}
+				snaps, files := listFiles(t, fx)
+				if len(snaps) != 0 || !slices.Equal(files, []uint64{0}) {
+					t.Fatalf("after the failure: snapshots %v, logs %v", snaps, files)
+				}
+				names, _ := fx.ReadDir(testDir)
+				for _, n := range names {
+					if strings.HasSuffix(n, tmpSuffix) {
+						t.Errorf("leftover %s", n)
+					}
+				}
 
-			// No retry on every commit: a failure costs another CompactAfter bytes.
-			mustApply(t, db, 7)
-			barrier(t, db)
-			if n := logged(logs, "log switch failed"); n != 1 {
-				t.Fatalf("%d switch attempts for 2 commits, want 1", n)
-			}
-			i := 8
-			waitFor(t, "compaction after the failed switch", func() bool {
-				if logged(logs, "compaction done") >= 1 {
-					return true
+				// No retry on every commit: a failure costs another CompactAfter bytes.
+				mustApply(t, db, 7)
+				barrier(t, db)
+				if n := logged(logs, "log switch failed"); n != 1 {
+					t.Fatalf("%d switch attempts for 2 commits, want 1", n)
 				}
-				mustApply(t, db, i)
-				i++
-				return false
+				i := 8
+				i = applyUntil(t, db, i, "compaction after the failed switch", func() bool { return logged(logs, "compaction done") >= 1 })
+				if err := db.Close(bg); err != nil {
+					t.Fatal(err)
+				}
+				db = mustOpen(t, fx, Options{})
+				mustCheck(t, db, i-1)
 			})
-			if err := db.Close(bg); err != nil {
-				t.Fatal(err)
-			}
-			db = mustOpen(t, fx, Options{})
-			mustCheck(t, db, i-1)
 		})
 	}
 }
@@ -613,35 +629,33 @@ func TestLogSwitchFailsDatabase(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fx := faultfs.New()
-			ctx, logs := debugCtx()
-			db := mustOpenCtx(t, ctx, fx, compactOpts())
-			for i := 1; i <= 5; i++ {
-				mustApply(t, db, i)
-			}
-			c.inject(fx)
-			mustApply(t, db, 6) // acknowledged: the failure comes after the reply
-			waitFor(t, "failed state", func() bool {
-				select {
-				case <-db.failed:
-					return true
-				default:
-					return false
+			synctest.Test(t, func(t *testing.T) {
+				fx := faultfs.New()
+				ctx, logs := debugCtx()
+				db := mustOpenCtx(t, ctx, fx, compactOpts())
+				for i := 1; i <= 5; i++ {
+					mustApply(t, db, i)
 				}
+				c.inject(fx)
+				mustApply(t, db, 6) // acknowledged: the failure comes after the reply
+				settle()            // the writer has seen the failure
+				if !failedDB(db) {
+					t.Fatal("the database did not fail")
+				}
+				var b Batch
+				b.Put([]byte("later"), nil)
+				if _, err := db.Apply(bg, &b); !errors.Is(err, ErrFailed) {
+					t.Fatalf("Apply after the failure: %v", err)
+				}
+				if !strings.Contains(logs.String(), "database failed") {
+					t.Errorf("failure not logged: %s", logs.String())
+				}
+				if err := db.Close(bg); !errors.Is(err, ErrFailed) {
+					t.Fatalf("Close = %v, want the failure", err)
+				}
+				db = mustOpen(t, fx, Options{})
+				mustCheck(t, db, 6)
 			})
-			var b Batch
-			b.Put([]byte("later"), nil)
-			if _, err := db.Apply(bg, &b); !errors.Is(err, ErrFailed) {
-				t.Fatalf("Apply after the failure: %v", err)
-			}
-			if !strings.Contains(logs.String(), "database failed") {
-				t.Errorf("failure not logged: %s", logs.String())
-			}
-			if err := db.Close(bg); !errors.Is(err, ErrFailed) {
-				t.Fatalf("Close = %v, want the failure", err)
-			}
-			db = mustOpen(t, fx, Options{})
-			mustCheck(t, db, 6)
 		})
 	}
 }
@@ -652,79 +666,82 @@ func TestLogSwitchFailsDatabase(t *testing.T) {
 // sync are gone; the database must fail rather than continue, and what is
 // left must open as a prefix.
 func TestLogSwitchSyncFailureDropsUnsyncedData(t *testing.T) {
-	fx := faultfs.New()
-	fx.DropOnSyncFailure(true)
-	opts := compactOpts()
-	opts.NoSync = true
-	db := mustOpen(t, fx, opts)
-	for i := 1; i <= 5; i++ {
-		mustApply(t, db, i)
-	}
-	fx.FailSync(1, nil)
-	mustApply(t, db, 6)
-	waitFor(t, "failed state", func() bool {
-		select {
-		case <-db.failed:
-			return true
-		default:
-			return false
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		fx.DropOnSyncFailure(true)
+		opts := compactOpts()
+		opts.NoSync = true
+		db := mustOpen(t, fx, opts)
+		for i := 1; i <= 5; i++ {
+			mustApply(t, db, i)
+		}
+		fx.FailSync(1, nil)
+		mustApply(t, db, 6)
+		settle() // the writer has seen the failure
+		if !failedDB(db) {
+			t.Fatal("the database did not fail")
+		}
+		if err := db.Close(bg); !errors.Is(err, ErrFailed) {
+			t.Fatalf("Close = %v, want the failure", err)
+		}
+		db = mustOpen(t, fx, Options{})
+		if n := mustCheck(t, db, 0); n != 0 {
+			t.Fatalf("recovered %d batches, want 0 (all were dropped)", n)
 		}
 	})
-	if err := db.Close(bg); !errors.Is(err, ErrFailed) {
-		t.Fatalf("Close = %v, want the failure", err)
-	}
-	db = mustOpen(t, fx, Options{})
-	if n := mustCheck(t, db, 0); n != 0 {
-		t.Fatalf("recovered %d batches, want 0 (all were dropped)", n)
-	}
 }
 
 // TestCloseWaitsForCompaction checks that Close does not cancel a running
 // compaction, waits for it, and leaves a directory that opens.
 func TestCloseWaitsForCompaction(t *testing.T) {
-	fx := faultfs.New()
-	started, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	h := &hookFS{FS: fx, hook: func(op, path string) error {
-		if op == "open" && strings.Contains(path, snapshotPrefix) {
-			once.Do(func() { close(started); <-release })
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		started, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		h := &hookFS{FS: fx, hook: func(op, path string) error {
+			if op == "open" && strings.Contains(path, snapshotPrefix) {
+				once.Do(func() { close(started); <-release })
+			}
+			return nil
+		}}
+		ctx, logs := debugCtx()
+		db := mustOpenCtx(t, ctx, h, compactOpts())
+		for i := 1; i <= 6; i++ {
+			mustApply(t, db, i)
 		}
-		return nil
-	}}
-	ctx, logs := debugCtx()
-	db := mustOpenCtx(t, ctx, h, compactOpts())
-	for i := 1; i <= 6; i++ {
-		mustApply(t, db, i)
-	}
-	select {
-	case <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the compactor did not start")
-	}
-	closed := make(chan error, 1)
-	go func() { closed <- db.Close(bg) }()
-	select {
-	case err := <-closed:
-		t.Fatalf("Close returned during the compaction: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	if _, err := db.Apply(bg, new(Batch)); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Apply while closing: %v", err)
-	}
-	close(release)
-	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
+		settle() // the compactor is parked in the hook
+		select {
+		case <-started:
+		default:
+			t.Fatal("the compactor did not start")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Close did not return after the compaction was released")
-	}
-	if logged(logs, "compaction done") != 1 || !settled(t, fx, 6) {
-		t.Fatalf("the compaction did not complete: %s", logs.String())
-	}
-	db = mustOpen(t, fx, Options{})
-	mustCheck(t, db, 6)
+		closed := make(chan error, 1)
+		go func() { closed <- db.Close(bg) }()
+		settle() // Close is blocked waiting for the compactor, which is parked in the hook
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned during the compaction: %v", err)
+		default:
+		}
+		if _, err := db.Apply(bg, new(Batch)); !errors.Is(err, ErrClosed) {
+			t.Fatalf("Apply while closing: %v", err)
+		}
+		close(release)
+		settle() // the compaction finishes and Close returns
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		default:
+			t.Fatal("Close did not return after the compaction was released")
+		}
+		if logged(logs, "compaction done") != 1 || !settled(t, fx, 6) {
+			t.Fatalf("the compaction did not complete: %s", logs.String())
+		}
+		db = mustOpen(t, fx, Options{})
+		mustCheck(t, db, 6)
+	})
 }
 
 // TestCloseDuringCompaction (AC9) closes the database while writers run and

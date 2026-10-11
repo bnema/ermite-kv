@@ -228,19 +228,17 @@ func (db *DB) Apply(ctx context.Context, b *Batch) (uint64, error) {
 		return 0, err
 	}
 
-	r := requestPool.Get().(*request)
-	r.b = b
+	r := &request{b: b, reply: make(chan result, 1)}
 	select {
 	case db.reqCh <- r:
 	case <-ctx.Done():
-		return 0, r.release(ctx.Err())
+		return 0, ctx.Err()
 	case <-db.closing:
-		return 0, r.release(db.stopped())
+		return 0, db.stopped()
 	case <-db.failed:
-		return 0, r.release(db.stopped())
+		return 0, db.stopped()
 	}
 	res := <-r.reply // the writer always answers a request it has taken
-	_ = r.release(nil)
 	return res.seq, res.err
 }
 
