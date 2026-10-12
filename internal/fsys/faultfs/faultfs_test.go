@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"bnema.dev/ermite-kv/internal/fsys"
@@ -140,16 +141,28 @@ func TestFailSyncAndCounters(t *testing.T) {
 }
 
 func TestSyncDelay(t *testing.T) {
-	f := New()
-	h := create(t, f, "/a")
-	f.SetSyncDelay(20 * time.Millisecond)
-	start := time.Now()
-	if err := h.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) < 20*time.Millisecond {
-		t.Fatal("sync returned before the delay")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		f := New()
+		h := create(t, f, "/a")
+		f.SetSyncDelay(20 * time.Millisecond)
+		for name, sync := range map[string]func() error{"Sync": h.Sync, "SyncAll": h.SyncAll} {
+			start := time.Now()
+			if err := sync(); err != nil {
+				t.Fatal(err)
+			}
+			if got := time.Since(start); got != 20*time.Millisecond {
+				t.Fatalf("%s took %v, want exactly 20ms", name, got)
+			}
+		}
+		f.SetSyncDelay(0)
+		start := time.Now()
+		if err := h.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if got := time.Since(start); got != 0 {
+			t.Fatalf("Sync without delay took %v", got)
+		}
+	})
 }
 
 func TestPowerLossDropsUnsyncedBytes(t *testing.T) {
