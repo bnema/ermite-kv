@@ -541,8 +541,7 @@ func TestCompactorRetryWithoutReopen(t *testing.T) {
 		if logged(logs, "compaction failed") != 1 {
 			t.Fatalf("compaction failure did not happen: %s", logs.String())
 		}
-		i := 7
-		i = applyUntil(t, db, i, "retried compaction", func() bool { return logged(logs, "compaction done") >= 1 })
+		applyUntil(t, db, 7, "retried compaction", func() bool { return logged(logs, "compaction done") >= 1 })
 		if err := db.Close(bg); err != nil {
 			t.Fatal(err)
 		}

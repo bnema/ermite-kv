@@ -1,5 +1,7 @@
 # ermite-kv
 
+> Read-only mirror. Development happens at git.bnema.dev; issues and pull requests are closed here.
+
 An embedded key-value store for Go. Data lives in memory and is persisted to an append-only log with snapshots. One writer goroutine groups commits into a single `fsync`, and readers use immutable snapshots without locks. Standard library only, plus [zerowrap](https://github.com/bnema/zerowrap) for logs.
 
 Status: early development, no stable API. Linux only.
