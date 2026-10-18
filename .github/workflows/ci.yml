@@ -8,7 +8,6 @@ on:
 env:
   # Test the module alone, with the versions in go.mod (never a go.work).
   GOWORK: "off"
-  GOPRIVATE: bnema.dev/ermite*
 
 jobs:
   lint:
