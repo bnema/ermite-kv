@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bnema/zerowrap"
+	"bnema.dev/zerowrap"
 
 	"bnema.dev/ermite-kv/internal/fsys"
 	"bnema.dev/ermite-kv/internal/fsys/faultfs"

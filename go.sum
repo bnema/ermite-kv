@@ -1,5 +1,5 @@
-github.com/bnema/zerowrap v1.4.1 h1:v70w8LDU2+FU+EX/etY9DjVwOAWN0fUKShwZyZHnyLU=
-github.com/bnema/zerowrap v1.4.1/go.mod h1:8M8Qz3uRpbszYkXqi0Dnr1TZ4lDrQY8/orGm30zwKKg=
+bnema.dev/zerowrap v1.5.0 h1:yr4tdbn4Yy1N3vuI6nt/GfQIKRMUNVIQYYcb3d7O4Kk=
+bnema.dev/zerowrap v1.5.0/go.mod h1:IbMbTgUZCybhUp4WC/QakFZLVwqaez7ag1wKm18KWxU=
 github.com/mattn/go-colorable v0.1.15 h1:+u9SLTRGnXv73cEsnsmoZBom+dMU88B2M0aDcWy0/jY=
 github.com/mattn/go-colorable v0.1.15/go.mod h1:6LmQG8QLFO4G5z1gPvYEzlUgJ2wF+stgPZH1UqBm1s8=
 github.com/mattn/go-isatty v0.0.22 h1:j8l17JJ9i6VGPUFUYoTUKPSgKe/83EYU2zBC7YNKMw4=

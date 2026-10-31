@@ -18,7 +18,7 @@
 - One writer groups commits into a single `fsync`
 - Lock-free reads from immutable snapshots
 - Conditional writes (`RequireAbsent`, `RequireVersion`)
-- Standard library only, plus [zerowrap](https://github.com/bnema/zerowrap) for logs
+- Standard library only, plus [zerowrap](https://git.bnema.dev/zerowrap) for logs
 
 Status: early development, no stable API. Linux only.
 

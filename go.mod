@@ -2,7 +2,7 @@ module bnema.dev/ermite-kv
 
 go 1.27
 
-require github.com/bnema/zerowrap v1.4.1
+require bnema.dev/zerowrap v1.5.0
 
 require (
 	github.com/mattn/go-colorable v0.1.15 // indirect
