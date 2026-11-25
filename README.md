@@ -17,7 +17,7 @@
 - Data in memory, persisted to an append-only log with snapshots
 - One writer groups commits into a single `fsync`
 - Lock-free reads from immutable snapshots
-- Large values (1 KiB and up, `Options.ColdValueBytes`) served from the memory-mapped snapshot file instead of the heap
+- Large values (1 KiB and up, `Options.ColdValueBytes`) served from the memory-mapped snapshot file instead of the heap once they are in a snapshot (at open, or after the next compaction); newer values stay on the heap until then
 - Conditional writes (`RequireAbsent`, `RequireVersion`)
 - Standard library only, plus [zerowrap](https://git.bnema.dev/zerowrap) for logs
 

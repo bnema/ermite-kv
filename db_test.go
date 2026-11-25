@@ -987,24 +987,45 @@ func TestPowerLoss(t *testing.T) {
 		{"keeppages", faultfs.PowerLossOptions{KeepPages: true}},
 		{"keeppages+zerofill", faultfs.PowerLossOptions{KeepPages: true, ZeroFill: true}},
 	}
+	// The cold variant maps every value and compacts often, so that swaps
+	// run while the power is cut.
+	variants := []struct {
+		name string
+		opts Options
+	}{
+		{"default", Options{}},
+		{"cold", Options{ColdValueBytes: 1, CompactAfter: 256}},
+	}
 	base := powerLossBase(t)
 	iterations := short(150, 10)
-	for _, m := range modes {
-		t.Run(m.name, func(t *testing.T) {
-			for i := range iterations {
-				seed := base + uint64(i)
-				if !runPowerLoss(t, seed, m.opts) {
-					t.Fatalf("failed with seed %d (ERMITE_KV_SEED=%d replays its parameters)", seed, seed)
-				}
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			var swaps int64
+			for _, m := range modes {
+				t.Run(m.name, func(t *testing.T) {
+					for i := range iterations {
+						seed := base + uint64(i)
+						if !runPowerLoss(t, seed, m.opts, v.opts, &swaps) {
+							t.Fatalf("failed with seed %d (ERMITE_KV_SEED=%d replays its parameters)", seed, seed)
+						}
+					}
+				})
+			}
+			if v.opts.ColdValueBytes > 0 && swaps == 0 {
+				t.Fatal("cold variant: no cold swap ever completed")
 			}
 		})
 	}
 }
 
-func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok bool) {
+// runPowerLoss runs one power-loss scenario with the options base (every
+// open) and adds the cold jobs completed by the databases to swaps.
+func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base Options, swaps *int64) (ok bool) {
 	rng := rand.New(rand.NewPCG(seed, 0x9e3779b97f4a7c15))
 	fx := faultfs.New()
-	db, err := open(testCtx(t), fx, testDir, Options{GroupWindow: time.Duration(rng.IntN(3)) * 100 * time.Microsecond})
+	o := base
+	o.GroupWindow = time.Duration(rng.IntN(3)) * 100 * time.Microsecond
+	db, err := open(testCtx(t), fx, testDir, o)
 	if err != nil {
 		t.Errorf("seed %d: open: %v", seed, err)
 		return false
@@ -1038,11 +1059,15 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok b
 		plo.PageSize = 64 // small pages: a group record spans several of them
 	}
 	fx.PowerLoss(plo)
-	wg.Wait()
+	// Close stops the writers: faultfs only invalidates the handles open at
+	// the power loss, so a log switch racing with it can go on with a fresh
+	// log, and Apply would keep succeeding.
 	_ = db.Close(bg)
+	wg.Wait()
+	*swaps += db.coldJobs.Load()
 	fx.SetSyncDelay(0)
 
-	db, err = open(testCtx(t), fx, testDir, Options{})
+	db, err = open(testCtx(t), fx, testDir, base)
 	if err != nil {
 		t.Errorf("seed %d: reopen after power loss: %v", seed, err)
 		return false
@@ -1050,6 +1075,20 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok b
 	defer func() { _ = db.Close(bg) }()
 	if !checkPowerLossState(t, seed, db.Snapshot(bg), acked, ackSeq) {
 		return false
+	}
+
+	// With cold values, sequential writes leave the writer idle between
+	// requests, so the cold work of their compactions completes.
+	if base.ColdValueBytes > 0 {
+		deadline := time.Now().Add(10 * time.Second)
+		for db.coldJobs.Load() == 0 {
+			if time.Now().After(deadline) {
+				t.Errorf("seed %d: no cold swap after recovery", seed)
+				return false
+			}
+			putKV(t, db, "swap", "x")
+		}
+		*swaps += db.coldJobs.Load()
 	}
 
 	// The recovered log accepts new records and survives another reopen.
@@ -1062,7 +1101,7 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions) (ok b
 		t.Errorf("seed %d: Close: %v", seed, err)
 		return false
 	}
-	db, err = open(testCtx(t), fx, testDir, Options{})
+	db, err = open(testCtx(t), fx, testDir, base)
 	if err != nil {
 		t.Errorf("seed %d: second reopen: %v", seed, err)
 		return false

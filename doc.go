@@ -20,8 +20,9 @@
 //     iterators and Item.Value are owned by the snapshot and must not be
 //     modified.
 //   - Values of at least Options.ColdValueBytes (1 KiB by default) are
-//     served from the memory-mapped snapshot file; smaller values and all
-//     keys are heap memory. Item.Value stays valid while the caller holds
+//     served from the memory-mapped snapshot file once they are in a
+//     snapshot (at Open, or after the next compaction); until then, and for
+//     smaller values and all keys, they are heap memory. Item.Value stays valid while the caller holds
 //     the Item or its Snapshot, and for at least one more compaction after
 //     that. A value kept longer must be copied (bytes.Clone, string(v)).
 //   - ErrFailed means a write or sync failed. The outcome of the batches in

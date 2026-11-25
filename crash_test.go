@@ -20,6 +20,10 @@ import (
 // test is skipped when it is unset.
 const crashChildEnv = "ERMITE_KV_CRASH_CHILD"
 
+// crashColdEnv, set to 1, makes the child serve every value from the mapped
+// snapshot (ColdValueBytes 1).
+const crashColdEnv = "ERMITE_KV_CRASH_COLD"
+
 // crashIterations returns ERMITE_KV_CRASH_ITERATIONS (default 20).
 func crashIterations(t *testing.T) int {
 	v := os.Getenv("ERMITE_KV_CRASH_ITERATIONS")
@@ -33,8 +37,15 @@ func crashIterations(t *testing.T) int {
 	return n
 }
 
-// crashOptions makes the child compact every few dozen batches.
-func crashOptions() Options { return Options{CompactAfter: 20 * recSize} }
+// crashOptions makes the child compact every few dozen batches. With cold,
+// every value is served from the mapped snapshot.
+func crashOptions(cold bool) Options {
+	o := Options{CompactAfter: 20 * recSize}
+	if cold {
+		o.ColdValueBytes = 1
+	}
+	return o
+}
 
 // TestCrashChild is the writer run by TestCrash in a child process. It
 // continues the sequence k<i> → v<i> where the previous run stopped and prints
@@ -44,7 +55,7 @@ func TestCrashChild(t *testing.T) {
 	if dir == "" {
 		t.Skip("only runs as the child of TestCrash")
 	}
-	db, err := Open(bg, dir, crashOptions())
+	db, err := Open(bg, dir, crashOptions(os.Getenv(crashColdEnv) == "1"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -105,11 +116,17 @@ func (a *ackReader) lastAcked() int {
 // is killed at a random time. After each kill the database must reopen, hold
 // every batch the child reported as acknowledged, and be exactly the batches
 // 1..N for some N at least as large. The next child continues from there, so
-// the directory goes through every kind of interrupted compaction.
+// the directory goes through every kind of interrupted compaction. The cold
+// variant maps every value, in the child and on reopen.
 func TestCrash(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
 	}
+	t.Run("default", func(t *testing.T) { testCrash(t, false) })
+	t.Run("cold", func(t *testing.T) { testCrash(t, true) })
+}
+
+func testCrash(t *testing.T, cold bool) {
 	seed := powerLossBase(t)
 	t.Logf("seed %d (ERMITE_KV_SEED=%d reproduces the kill delays)", seed, seed)
 	rng := rand.New(rand.NewPCG(seed, 0x9e3779b97f4a7c15))
@@ -119,11 +136,14 @@ func TestCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	total := 0
+	total, mapped := 0, 0
 	for i := range crashIterations(t) {
 		acks := new(ackReader)
 		cmd := exec.Command(exe, "-test.run=^TestCrashChild$", "-test.count=1")
 		cmd.Env = append(os.Environ(), crashChildEnv+"="+dir)
+		if cold {
+			cmd.Env = append(cmd.Env, crashColdEnv+"=1")
+		}
 		cmd.Stdout = acks
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
@@ -143,12 +163,17 @@ func TestCrash(t *testing.T) {
 		}
 		acked := acks.lastAcked()
 
-		db, err := Open(bg, dir, Options{})
+		var opts Options
+		if cold {
+			opts.ColdValueBytes = 1
+		}
+		db, err := Open(bg, dir, opts)
 		if err != nil {
 			t.Fatalf("iteration %d (killed after %v, %d acknowledged, seed %d): reopen: %v\nchild stderr: %s",
 				i, delay, acked, seed, err, stderr.String())
 		}
 		n, err := checkSequential(db.Snapshot(bg), acked)
+		mapped += coldCount(db.Snapshot(bg))
 		if cerr := db.Close(bg); err == nil {
 			err = cerr
 		}
@@ -159,6 +184,9 @@ func TestCrash(t *testing.T) {
 	}
 	if total == 0 {
 		t.Fatal("the child never acknowledged a batch")
+	}
+	if cold && mapped == 0 {
+		t.Fatal("cold variant: no value was ever mapped on reopen")
 	}
 	t.Logf("%d batches recovered after %d kills", total, crashIterations(t))
 }
