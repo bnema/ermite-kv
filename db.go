@@ -19,6 +19,7 @@ import (
 const (
 	defaultMaxBatchBytes = 16 << 20
 	defaultCompactAfter  = 64 << 20
+	defaultColdValue     = 1 << 10
 
 	// maxBatchLimit is the largest encoded batch that fits in a record
 	// together with the record head (seq and batch count).
@@ -43,6 +44,10 @@ type Options struct {
 	// GroupWindow is the extra time the writer waits to grow a commit
 	// group. 0 means it only drains what is already queued.
 	GroupWindow time.Duration
+	// ColdValueBytes is the value size from which Open and compaction serve
+	// a value from the mmapped snapshot instead of the heap. 0 means 1 KiB;
+	// a negative value keeps every value on the heap.
+	ColdValueBytes int
 }
 
 // resolve validates o and fills in the defaults.
@@ -58,6 +63,9 @@ func (o Options) resolve() (Options, error) {
 	}
 	if o.CompactAfter == 0 {
 		o.CompactAfter = defaultCompactAfter
+	}
+	if o.ColdValueBytes == 0 {
+		o.ColdValueBytes = defaultColdValue
 	}
 	return o, nil
 }

@@ -1221,3 +1221,20 @@ func TestErr(t *testing.T) {
 		})
 	}
 }
+
+func TestOptionsColdValueBytes(t *testing.T) {
+	for _, tc := range []struct{ in, want int }{
+		{0, 1024},
+		{-1, -1},
+		{1, 1},
+		{4096, 4096},
+	} {
+		o, err := Options{ColdValueBytes: tc.in}.resolve()
+		if err != nil {
+			t.Fatalf("resolve(%d): %v", tc.in, err)
+		}
+		if o.ColdValueBytes != tc.want {
+			t.Fatalf("resolve(%d) = %d, want %d", tc.in, o.ColdValueBytes, tc.want)
+		}
+	}
+}
