@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"path/filepath"
 	"time"
+
+	"bnema.dev/ermite-kv/internal/fsys"
 )
 
 // maybeCompact starts a compaction once the current log holds more than
@@ -101,7 +103,10 @@ func (db *DB) removeStrayLog(path string) error {
 func (db *DB) compact(snap *Snapshot) {
 	start := time.Now()
 	seq := snap.Seq()
-	size, err := db.writeSnapshotFile(snap)
+	size, w, err := db.writeSnapshotFile(snap)
+	if w != nil {
+		db.sendCold(w)
+	}
 	if err == nil {
 		err = db.removeObsolete(seq)
 	}
@@ -113,8 +118,10 @@ func (db *DB) compact(snap *Snapshot) {
 		Dur("duration", time.Since(start)).Msg("compaction done")
 }
 
-// writeSnapshotFile durably creates snapshot-<snap.Seq()> and returns its size.
-func (db *DB) writeSnapshotFile(snap *Snapshot) (int64, error) {
+// writeSnapshotFile durably creates snapshot-<snap.Seq()> and returns its
+// size and, if some values can be served from the new file, the cold work for
+// the writer.
+func (db *DB) writeSnapshotFile(snap *Snapshot) (int64, *coldWork, error) {
 	seq := snap.Seq()
 	entries := func(yield func(key, value []byte, version uint64) bool) {
 		for k, it := range snap.t.ascend(nil, nil) {
@@ -127,11 +134,79 @@ func (db *DB) writeSnapshotFile(snap *Snapshot) (int64, error) {
 		return writeSnapshot(w, seq, uint64(snap.Len()), entries)
 	})
 	if err != nil {
-		return 0, fmt.Errorf("write snapshot: %w", err)
+		return 0, nil, fmt.Errorf("write snapshot: %w", err)
 	}
 	size, _ := f.Size() // informational
-	_ = f.Close()       // the file is synced and renamed; nothing is pending
-	return size, nil
+	w := db.coldWork(f, filepath.Join(db.dir, snapshotName(seq)), seq)
+	_ = f.Close() // the file is synced and renamed; nothing is pending
+	return size, w, nil
+}
+
+// coldWork is the set of values of a new snapshot file that the writer can
+// serve from its mapping instead of the heap.
+type coldWork struct {
+	m     *mapping
+	cands []coldCand
+}
+
+// coldCand is one large value of the snapshot. key and value alias m.data:
+// the writer keeps the tree's existing heap key (setValue) and only uses key
+// to find the entry.
+type coldCand struct {
+	key     []byte
+	version uint64
+	value   []byte
+}
+
+// coldWork maps the synced snapshot file f, stored at path, and collects its
+// values of at least Options.ColdValueBytes. It returns nil when the option
+// is disabled, when there is no such value, or on failure, which only logs a
+// warning: the compaction itself has succeeded.
+func (db *DB) coldWork(f fsys.File, path string, seq uint64) *coldWork {
+	if db.opts.ColdValueBytes < 0 {
+		return nil
+	}
+	data, unmap, err := f.Map()
+	if err != nil {
+		db.log.Warn().Err(err).Str("file", path).Msg("cannot map new snapshot")
+		return nil
+	}
+	view, err := openSnapshot(data)
+	if err == nil && view.seq != seq {
+		err = fmt.Errorf("%w: snapshot seq %d, want %d", ErrCorrupt, view.seq, seq)
+	}
+	if err != nil {
+		_ = unmap()
+		db.log.Warn().Err(err).Str("file", path).Msg("new snapshot does not validate once mapped")
+		return nil
+	}
+	var cands []coldCand
+	view.each(func(key, value []byte, version uint64) {
+		if len(value) >= db.opts.ColdValueBytes {
+			cands = append(cands, coldCand{key: key, version: version, value: value})
+		}
+	})
+	if len(cands) == 0 {
+		_ = unmap()
+		return nil
+	}
+	return &coldWork{m: newMapping(data, unmap, path), cands: cands}
+}
+
+// sendCold hands w to the writer through the one-slot db.coldCh. A job still
+// waiting in the slot is dropped first: w comes from a newer snapshot and
+// supersedes it. Only the compactor sends and at most one compactor runs, so
+// the slot is free after the drain and the send never blocks, even once the
+// writer has exited.
+func (db *DB) sendCold(w *coldWork) {
+	select {
+	case <-db.coldCh:
+	default:
+	}
+	select {
+	case db.coldCh <- w:
+	default: // unreachable while a single compactor sends
+	}
 }
 
 // removeObsolete deletes the snapshots and logs with a seq below seq, then

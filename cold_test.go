@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"bnema.dev/ermite-kv/internal/fsys"
 )
@@ -97,5 +98,89 @@ func TestColdValuesOnOpen(t *testing.T) {
 			checkCold(t, s, "big", big, tc.bigMapped)
 			checkCold(t, s, "small", small, tc.smallM)
 		})
+	}
+}
+
+// receiveCold waits for the next cold work of db.
+func receiveCold(t *testing.T, db *DB) *coldWork {
+	t.Helper()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case w := <-db.coldCh:
+		return w
+	case <-timer.C:
+		t.Fatal("no cold work")
+	}
+	return nil
+}
+
+// closeBounded closes db and fails if Close does not return in time.
+func closeBounded(t *testing.T, db *DB) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- db.Close(bg) }()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-timer.C:
+		t.Fatal("Close hangs")
+	}
+}
+
+func TestColdWorkFromCompaction(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1024})
+	big1 := bytes.Repeat([]byte("1"), 1024)
+	big2 := bytes.Repeat([]byte("2"), 3000)
+	var b Batch
+	b.Put([]byte("a"), big1)
+	b.Put([]byte("b"), []byte("small"))
+	b.Put([]byte("c"), big2)
+	seq, err := db.Apply(bg, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := receiveCold(t, db)
+	if w.m == nil || len(w.cands) != 2 {
+		t.Fatalf("cold work = %+v", w)
+	}
+	want := map[string][]byte{"a": big1, "c": big2}
+	for _, c := range w.cands {
+		if !bytes.Equal(c.value, want[string(c.key)]) || c.version != seq {
+			t.Fatalf("candidate %s: version %d (want %d), %d value bytes", c.key, c.version, seq, len(c.value))
+		}
+		delete(want, string(c.key))
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing candidates %v", want)
+	}
+	if filepath.Base(w.m.name) != snapshotName(seq) {
+		t.Fatalf("mapping name = %s", w.m.name)
+	}
+}
+
+func TestColdWorkDisabled(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: -1})
+	for i := range 20 {
+		mustApply(t, db, i+1)
+	}
+	closeBounded(t, db) // waits for the compactors
+	if n := len(db.coldCh); n != 0 {
+		t.Fatalf("%d cold work sent with ColdValueBytes -1", n)
+	}
+}
+
+func TestColdWorkWithoutReaderDoesNotBlockClose(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1})
+	for i := range 50 {
+		mustApply(t, db, i+1)
+	}
+	closeBounded(t, db)
+	if n := len(db.coldCh); n != 1 {
+		t.Fatalf("coldCh holds %d jobs, want 1", n)
 	}
 }

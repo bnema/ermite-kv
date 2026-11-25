@@ -94,6 +94,7 @@ type DB struct {
 
 	compacting atomic.Bool    // a compactor goroutine is running
 	compactors sync.WaitGroup // started by the writer only; Close waits after the writer exits
+	coldCh     chan *coldWork // capacity 1: the latest cold work for the writer
 
 	// Owned by the writer goroutine (see writer.go).
 	file    fsys.File
@@ -160,6 +161,7 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 		closing: make(chan struct{}),
 		done:    make(chan struct{}),
 		failed:  make(chan struct{}),
+		coldCh:  make(chan *coldWork, 1),
 		lock:    rec.lock,
 		file:    rec.log,
 		logBase: rec.logBase,
