@@ -94,11 +94,11 @@ type nsOp struct {
 type FS struct {
 	viewMu sync.RWMutex // held for writing by PowerLoss, for reading by View ops
 	mu     sync.Mutex
-	files map[string]*node
-	dirs  map[string]bool
-	locks map[string]bool
-	ns    []*nsOp // directory operations not yet made durable
-	epoch uint64  // incremented by PowerLoss
+	files  map[string]*node
+	dirs   map[string]bool
+	locks  map[string]bool
+	ns     []*nsOp // directory operations not yet made durable
+	epoch  uint64  // incremented by PowerLoss
 
 	writes, syncs, syncAlls int
 	failWrite               map[int]writeFault // by absolute write number

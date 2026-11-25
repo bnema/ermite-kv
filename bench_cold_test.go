@@ -8,7 +8,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -95,7 +94,6 @@ func benchGet(b *testing.B, cold int) {
 		}
 	}
 	s := db.Snapshot(bg)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		it, _ := s.Get(bg, keys[i%len(keys)])
 		benchSink ^= it.Value[len(it.Value)/2]
@@ -109,7 +107,6 @@ func benchPrefix(b *testing.B, cold int) {
 	entries, _ := coldEntries()
 	db := openBench(b, writeColdDataset(b, entries), cold)
 	s := db.Snapshot(bg)
-	b.ResetTimer()
 	for b.Loop() {
 		for _, it := range s.Prefix(bg, []byte("job/")) {
 			benchSink ^= it.Value[len(it.Value)/2]
@@ -119,40 +116,3 @@ func benchPrefix(b *testing.B, cold int) {
 
 func BenchmarkColdPrefix(b *testing.B) { benchPrefix(b, 0) }
 func BenchmarkHotPrefix(b *testing.B)  { benchPrefix(b, -1) }
-
-// heapAfterOpen returns the heap growth caused by opening dir with cold, the
-// DB still open.
-func heapAfterOpen(t *testing.T, dir string, cold int) int64 {
-	var ms runtime.MemStats
-	runtime.GC()
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	before := int64(ms.HeapAlloc)
-	db, err := Open(bg, dir, Options{ColdValueBytes: cold, CompactAfter: -1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.GC()
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	grown := int64(ms.HeapAlloc) - before
-	if err := db.Close(bg); err != nil {
-		t.Fatal(err)
-	}
-	return grown
-}
-
-func TestColdHeapAfterOpen(t *testing.T) {
-	if testing.Short() {
-		t.Skip("writes a 20 MB dataset")
-	}
-	entries, coldBytes := coldEntries()
-	dir := writeColdDataset(t, entries)
-	hot := heapAfterOpen(t, dir, -1)
-	cold := heapAfterOpen(t, dir, 0)
-	t.Logf("cold values %d bytes; heap after Open: %d bytes all on heap, %d bytes mapped (saved %d)",
-		coldBytes, hot, cold, hot-cold)
-	if saved := hot - cold; saved < coldBytes*9/10 {
-		t.Fatalf("mapped Open saves %d bytes, want at least 90%% of %d", saved, coldBytes)
-	}
-}

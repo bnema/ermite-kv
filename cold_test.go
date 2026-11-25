@@ -9,12 +9,16 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"bnema.dev/zerowrap"
+
 	"bnema.dev/ermite-kv/internal/fsys"
+	"bnema.dev/ermite-kv/internal/fsys/faultfs"
 )
 
 // coldCount returns the number of items of s served from a snapshot mapping.
@@ -137,6 +141,9 @@ func TestColdWorkFromCompaction(t *testing.T) {
 	}
 	waitColdJobs(t, db, 1)
 	s := db.Snapshot(bg)
+	if s.Seq() != seq {
+		t.Fatalf("seq = %d, want %d: a swap must not change it", s.Seq(), seq)
+	}
 	checkCold(t, s, "a", big1, true)
 	checkCold(t, s, "b", []byte("small"), false)
 	checkCold(t, s, "c", big2, true)
@@ -159,14 +166,6 @@ func TestColdWorkDisabled(t *testing.T) {
 	}
 }
 
-func TestColdWorkDoesNotBlockClose(t *testing.T) {
-	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1})
-	for i := range 50 {
-		mustApply(t, db, i+1)
-	}
-	closeBounded(t, db)
-}
-
 // waitColdJobs waits until db has completed n cold jobs.
 func waitColdJobs(t *testing.T, db *DB, n int64) {
 	t.Helper()
@@ -176,26 +175,6 @@ func waitColdJobs(t *testing.T, db *DB, n int64) {
 			t.Fatalf("cold jobs done = %d, want %d", db.coldJobs.Load(), n)
 		}
 		runtime.Gosched()
-	}
-}
-
-func TestColdSwapAfterCompaction(t *testing.T) {
-	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1024})
-	big := bytes.Repeat([]byte("x"), 2000)
-	var b Batch
-	b.Put([]byte("a"), big)
-	b.Put([]byte("b"), []byte("small"))
-	b.Put([]byte("c"), big)
-	if _, err := db.Apply(bg, &b); err != nil {
-		t.Fatal(err)
-	}
-	waitColdJobs(t, db, 1)
-	s := db.Snapshot(bg)
-	checkCold(t, s, "a", big, true)
-	checkCold(t, s, "b", []byte("small"), false)
-	checkCold(t, s, "c", big, true)
-	if s.Seq() != 1 {
-		t.Fatalf("seq = %d", s.Seq())
 	}
 }
 
@@ -250,17 +229,6 @@ func TestColdSwapInChunks(t *testing.T) {
 		checkCold(t, s, string(treeKey(i)), val(i), true)
 	}
 	mustGet(t, s, "during", "swap")
-}
-
-func TestCloseWithPendingColdWork(t *testing.T) {
-	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
-	m := fakeMapping("v")
-	cands := make([]coldCand, 100*coldChunk)
-	for i := range cands {
-		cands[i] = coldCand{key: treeKey(i), version: 1, value: m.data}
-	}
-	db.coldCh <- &coldWork{m: m, cands: cands}
-	closeBounded(t, db)
 }
 
 // watchReleases records the names of the mappings released while the test
@@ -485,5 +453,155 @@ func TestColdWorkWithoutCandidates(t *testing.T) {
 	waitColdJobs(t, db, 1)
 	if n := coldCount(db.Snapshot(bg)); n != 0 {
 		t.Fatalf("coldCount = %d", n)
+	}
+}
+
+// fillKeys puts n keys treeKey(0..n-1) in one batch and returns its seq.
+func fillKeys(t *testing.T, db *DB, n int) uint64 {
+	t.Helper()
+	var b Batch
+	for i := range n {
+		b.Put(treeKey(i), []byte("v"))
+	}
+	seq, err := db.Apply(bg, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// jobFor returns a cold job repointing keys treeKey(0..n-1) at version to a
+// new mapping named name, released through the cleanup like a real one.
+func jobFor(name string, n int, version uint64) *coldWork {
+	m := newMapping([]byte("v"), func() error { return nil }, name)
+	cands := make([]coldCand, n)
+	for i := range cands {
+		cands[i] = coldCand{key: treeKey(i), version: version, value: m.data}
+	}
+	return &coldWork{m: m, cands: cands}
+}
+
+// waitColdChunks waits until db has applied n cold chunks.
+func waitColdChunks(t *testing.T, db *DB, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for db.coldChunks.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("cold chunks = %d, want %d", db.coldChunks.Load(), n)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestCloseWithPendingColdWork(t *testing.T) {
+	const n = 200 * coldChunk
+	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
+	seq := fillKeys(t, db, n)
+	db.coldCh <- jobFor(t.Name(), n, seq)
+	waitColdChunks(t, db, 1) // the job publishes: it is in progress
+	closeBounded(t, db)
+	if j := db.coldJobs.Load(); j != 0 {
+		t.Fatalf("cold jobs = %d: the job finished before Close", j)
+	}
+}
+
+func TestColdMapFailureKeepsCompacting(t *testing.T) {
+	fx := faultfs.New()
+	var logs syncBuffer
+	ctx := zerowrap.WithCtx(bg, zerowrap.New(zerowrap.Config{Level: "debug", Format: "json", Output: &logs}))
+	fx.FailOp(faultfs.OpMap, 1, nil) // the map of the first new snapshot
+	db := mustOpenCtx(t, ctx, fx, Options{CompactAfter: 1, ColdValueBytes: 1})
+	seq := putKV(t, db, "a", "value")
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(logs.String(), "compaction done") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no compaction; logs:\n%s", logs.String())
+		}
+		runtime.Gosched()
+	}
+	if !strings.Contains(logs.String(), "cannot map new snapshot") {
+		t.Fatalf("no map warning; logs:\n%s", logs.String())
+	}
+	if _, ok := fx.ReadFile(filepath.Join(testDir, snapshotName(seq))); !ok {
+		t.Fatal("snapshot not written")
+	}
+	if j := db.coldJobs.Load(); j != 0 {
+		t.Fatalf("cold jobs = %d after a failed map", j)
+	}
+	putKV(t, db, "b", "still works")
+	mustGet(t, db.Snapshot(bg), "a", "value")
+}
+
+func TestColdSupersededPartialJobStaysPinned(t *testing.T) {
+	released := watchReleases(t)
+	const n = 200 * coldChunk
+	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
+	seq := fillKeys(t, db, n)
+	first, second := t.Name()+"/first", t.Name()+"/second"
+	db.coldCh <- jobFor(first, n, seq)
+	waitColdChunks(t, db, 1) // the first job published a chunk
+	db.coldCh <- jobFor(second, n, seq)
+	waitColdJobs(t, db, 1) // the second job replaced it and completed
+	if j := db.coldJobs.Load(); j != 1 {
+		t.Fatalf("cold jobs = %d: the first job completed before being superseded", j)
+	}
+	// The tree no longer references the first mapping: only the pins do.
+	for range 5 {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	if released(first) {
+		t.Fatal("superseded partial mapping released before the next swap")
+	}
+	db.coldCh <- &coldWork{} // the next swap
+	waitColdJobs(t, db, 2)
+	deadline := time.Now().Add(10 * time.Second)
+	for !released(first) {
+		if time.Now().After(deadline) {
+			t.Fatal("superseded partial mapping not released after the next swap")
+		}
+		runtime.GC()
+		runtime.Gosched()
+	}
+	if released(second) {
+		t.Fatal("pinned generation released too early")
+	}
+}
+
+// heapAfterOpen returns the heap growth caused by opening dir with cold, the
+// DB still open.
+func heapAfterOpen(t *testing.T, dir string, cold int) int64 {
+	t.Helper()
+	var ms runtime.MemStats
+	runtime.GC()
+	runtime.GC()
+	runtime.ReadMemStats(&ms)
+	before := int64(ms.HeapAlloc)
+	db, err := Open(bg, dir, Options{ColdValueBytes: cold, CompactAfter: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.GC()
+	runtime.ReadMemStats(&ms)
+	grown := int64(ms.HeapAlloc) - before
+	if err := db.Close(bg); err != nil {
+		t.Fatal(err)
+	}
+	return grown
+}
+
+func TestColdHeapAfterOpen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes a 20 MB dataset")
+	}
+	entries, coldBytes := coldEntries()
+	dir := writeColdDataset(t, entries)
+	hot := heapAfterOpen(t, dir, -1)
+	cold := heapAfterOpen(t, dir, 0)
+	t.Logf("cold values %d bytes; heap after Open: %d bytes all on heap, %d bytes mapped (saved %d)",
+		coldBytes, hot, cold, hot-cold)
+	if saved := hot - cold; saved < coldBytes*9/10 {
+		t.Fatalf("mapped Open saves %d bytes, want at least 90%% of %d", saved, coldBytes)
 	}
 }
