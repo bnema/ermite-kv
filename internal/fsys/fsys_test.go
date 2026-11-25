@@ -84,3 +84,48 @@ func TestOSLock(t *testing.T) {
 	}
 	_ = l.Close()
 }
+
+func TestOSMapOutlivesFileAndPath(t *testing.T) {
+	fx := OS()
+	name := filepath.Join(t.TempDir(), "m")
+	want := []byte("mapped content")
+	if err := os.WriteFile(name, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fx.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, unmap, err := f.Map()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.Remove(name); err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(want) {
+		t.Fatalf("data = %q, want %q", data, want)
+	}
+	if err := unmap(); err != nil {
+		t.Fatalf("unmap: %v", err)
+	}
+	if err := unmap(); err != nil {
+		t.Fatalf("second unmap: %v", err)
+	}
+}
+
+func TestOSMapEmptyFile(t *testing.T) {
+	fx := OS()
+	name := filepath.Join(t.TempDir(), "e")
+	f, err := fx.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, _, err := f.Map(); err == nil {
+		t.Fatal("Map of empty file succeeded")
+	}
+}

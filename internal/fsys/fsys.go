@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync"
 	"syscall"
 )
 
@@ -50,6 +51,10 @@ type File interface {
 	SyncAll() error
 	Truncate(size int64) error
 	Size() (int64, error)
+	// Map maps the whole file read-only. The mapping stays valid after the
+	// file is closed or removed, until unmap is called. unmap is idempotent.
+	// Mapping an empty file is an error.
+	Map() (data []byte, unmap func() error, err error)
 	Close() error
 }
 
@@ -131,6 +136,34 @@ func (f osFile) Size() (int64, error) {
 		return 0, err
 	}
 	return fi.Size(), nil
+}
+
+func (f osFile) Map() ([]byte, func() error, error) {
+	size, err := f.Size()
+	if err != nil {
+		return nil, nil, err
+	}
+	if size <= 0 {
+		return nil, nil, &os.PathError{Op: "mmap", Path: f.Name(), Err: syscall.EINVAL}
+	}
+	if int64(int(size)) != size {
+		return nil, nil, &os.PathError{Op: "mmap", Path: f.Name(), Err: syscall.EFBIG}
+	}
+	var data []byte
+	if err := control(f.File, func(fd int) error {
+		var merr error
+		data, merr = syscall.Mmap(fd, 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+		return merr
+	}); err != nil {
+		return nil, nil, &os.PathError{Op: "mmap", Path: f.Name(), Err: err}
+	}
+	var once sync.Once
+	unmap := func() error {
+		var uerr error
+		once.Do(func() { uerr = syscall.Munmap(data) })
+		return uerr
+	}
+	return data, unmap, nil
 }
 
 // control runs fn on the file descriptor, retrying on EINTR.

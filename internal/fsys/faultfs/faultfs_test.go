@@ -500,3 +500,50 @@ func TestDropOnSyncFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestMap(t *testing.T) {
+	f := New()
+	h := create(t, f, "/m")
+	if _, _, err := h.Map(); err == nil {
+		t.Fatal("Map of empty file succeeded")
+	}
+	write(t, h, "hello")
+	data, unmap, err := h.Map()
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("Map = %q %v", data, err)
+	}
+	write(t, h, " world") // the copy does not alias the file
+	if string(data) != "hello" {
+		t.Fatalf("data changed to %q", data)
+	}
+	if err := unmap(); err != nil {
+		t.Fatal(err)
+	}
+	if err := unmap(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := f.OpenFile("/m", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Map(); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Map on write-only handle = %v", err)
+	}
+
+	h2, err := f.OpenFile("/m", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h2.Map(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("Map on closed file = %v", err)
+	}
+
+	f.PowerLoss(PowerLossOptions{})
+	if _, _, err := h.Map(); !errors.Is(err, ErrPowerLoss) {
+		t.Fatalf("Map after power loss = %v", err)
+	}
+}

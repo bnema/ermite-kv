@@ -619,6 +619,22 @@ func (h *file) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+// Map returns a copy of the file's current content and a no-op unmap.
+func (h *file) Map() ([]byte, func() error, error) {
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	if err := h.check(); err != nil {
+		return nil, nil, err
+	}
+	if !h.read {
+		return nil, nil, &fs.PathError{Op: "mmap", Err: fs.ErrPermission}
+	}
+	if len(h.n.data) == 0 {
+		return nil, nil, &fs.PathError{Op: "mmap", Err: fs.ErrInvalid}
+	}
+	return slices.Clone(h.n.data), func() error { return nil }, nil
+}
+
 func (h *file) Sync() error    { return h.sync(false) }
 func (h *file) SyncAll() error { return h.sync(true) }
 
