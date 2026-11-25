@@ -25,9 +25,9 @@
 //     values and values written since the last compaction are on the heap.
 //   - A value read from the DB stays valid while its Snapshot is reachable.
 //     Without the Snapshot, it stays valid at least until the end of the
-//     first compaction that starts after the read, and while the DB is
-//     reachable once it is closed or failed. Copy a value (bytes.Clone,
-//     string(v)) to use it longer.
+//     first compaction that completes after the read, and while the DB is
+//     reachable once it is closed or failed. Use it within the current
+//     operation, or copy it (bytes.Clone, string(v)) to keep it longer.
 //   - ErrFailed means a write or sync failed. The outcome of the batches in
 //     that commit group is unknown (they may be replayed by the next Open);
 //     every later Apply fails, while reads keep serving the last snapshot.

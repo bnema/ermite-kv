@@ -191,8 +191,9 @@ func (db *DB) coldSwapped() {
 //     swapped out with. The next completed swap releases them.
 //
 // A value read while a mapping is current is released at the earliest by the
-// second swap after the read, which ends the first compaction that started
-// after the read: the lifetime documented on Item.Value.
+// second swap after the read, which comes at the earliest from the first
+// compaction that completes after the read: the lifetime documented on
+// Item.Value.
 //
 // Owned by the writer goroutine. The pins stay after the writer exits (Close
 // or failure) and live as long as the DB is reachable, since no swap can

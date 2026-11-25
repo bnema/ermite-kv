@@ -54,7 +54,7 @@ Durability, visibility and value lifetime guarantees are in the package document
 - Only the database writes its directory: never modify, truncate or replace its files while it is open.
 - A disk I/O error while reading a memory-mapped value raises `SIGBUS` and crashes the process.
 - Mapped values live in the page cache: file-backed, reclaimable memory, not heap.
-- A value stays valid while its `Snapshot` is reachable. Without the `Snapshot`, it stays valid at least until the end of the first compaction that starts after the read, and while the database is reachable once closed or failed. Copy values you keep longer (`bytes.Clone`, `string(v)`).
+- A value stays valid while its `Snapshot` is reachable. Without the `Snapshot`, it stays valid at least until the end of the first compaction that completes after the read, and while the database is reachable once closed or failed. Use it within the current operation, or copy it (`bytes.Clone`, `string(v)`) to keep it longer.
 
 ## Test
 

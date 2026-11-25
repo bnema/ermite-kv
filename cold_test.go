@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"bnema.dev/zerowrap"
@@ -361,52 +362,46 @@ func TestPinsBookkeeping(t *testing.T) {
 	}
 }
 
-// TestColdSwapUnderLoad keeps the writer busy: batches over half of
-// maxGroupBytes never share a group, so with several writers a request is
-// always pending and the writer is never idle. The cold job, sent once the
-// writers are saturated, must still complete before a bounded number of
-// batches (each batch writes about 2 MB).
+// TestColdSwapUnderLoad checks that cold work arriving while requests are
+// queued completes under that load. In a synctest bubble, writers batches
+// bigger than half of maxGroupBytes all wait on the writer, which is parked
+// in a slow sync: every group overflows, so a request is always pending and
+// the writer never reaches its idle path until the queue is empty. The job
+// must be taken and applied (after coldEvery groups) while the queue drains.
 func TestColdSwapUnderLoad(t *testing.T) {
-	const chunks = 2
-	const saturated = 8                           // batches before the job is sent
-	const budget = saturated + 3*coldEvery*chunks // total batches
-	db := openCold(t, t.TempDir(), Options{CompactAfter: -1, NoSync: true})
-	big := make([]byte, maxGroupBytes/2+1)
-	m := fakeMapping("v")
-	cands := make([]coldCand, (chunks-1)*coldChunk+1)
-	for i := range cands {
-		cands[i] = coldCand{key: treeKey(i), version: 1, value: m.data}
-	}
-	var wg sync.WaitGroup
-	var started, writes atomic.Int64
-	for g := range 4 {
-		wg.Go(func() {
-			for started.Add(1) <= budget {
+	const writers = coldEvery + 8
+	synctest.Test(t, func(t *testing.T) {
+		fx := faultfs.New()
+		db := mustOpen(t, fx, Options{CompactAfter: -1})
+		fx.SetSyncDelay(time.Millisecond)
+		big := make([]byte, maxGroupBytes/2+1)
+		var replies atomic.Int64
+		var swappedAt atomic.Int64 // number of replies when the swap was first seen
+		var wg sync.WaitGroup
+		for g := range writers {
+			wg.Go(func() {
 				var b Batch
 				b.Put(fmt.Appendf(nil, "w%d", g), big)
 				if _, err := db.Apply(bg, &b); err != nil {
 					t.Errorf("apply: %v", err)
-					return
 				}
-				writes.Add(1)
-			}
-		})
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for writes.Load() < saturated {
-		if time.Now().After(deadline) {
-			t.Fatal("writers not saturated")
+				n := replies.Add(1)
+				if db.coldJobs.Load() > 0 {
+					swappedAt.CompareAndSwap(0, n)
+				}
+			})
 		}
-		runtime.Gosched()
-	}
-	db.coldCh <- &coldWork{m: m, cands: cands}
-	wg.Wait()
-	if j := db.coldJobs.Load(); j != 1 {
-		t.Fatalf("cold jobs = %d after %d batches, want 1", j, budget)
-	}
-	if c := db.coldChunks.Load(); c != chunks {
-		t.Fatalf("cold chunks = %d, want %d", c, chunks)
-	}
+		synctest.Wait() // the writer sleeps in a sync; the others are queued
+		m := fakeMapping("v") // no cleanup inside the bubble
+		db.coldCh <- &coldWork{m: m, cands: []coldCand{{key: []byte("w0"), version: 1, value: m.data}}}
+		wg.Wait()
+		if j := db.coldJobs.Load(); j != 1 {
+			t.Fatalf("cold jobs = %d, want 1", j)
+		}
+		if at := swappedAt.Load(); at == 0 || at > writers-4 {
+			t.Fatalf("swap first seen after reply %d of %d: not applied under load", at, writers)
+		}
+	})
 }
 
 // TestColdPinsClosedDB checks that Close keeps the pins: a bare value of the
@@ -507,6 +502,9 @@ func TestCloseWithPendingColdWork(t *testing.T) {
 	seq := fillKeys(t, db, n)
 	sendJob(db, n, seq)
 	waitColdChunks(t, db, 1) // the job publishes: it is in progress
+	if j := db.coldJobs.Load(); j != 0 {
+		t.Fatalf("cold jobs = %d: the job finished before Close", j)
+	}
 	closeBounded(t, db)
 	if j := db.coldJobs.Load(); j != 0 {
 		t.Fatalf("cold jobs = %d: the job finished before Close", j)
@@ -547,6 +545,9 @@ func TestColdSupersededPartialJobStaysPinned(t *testing.T) {
 	first := sendJob(db, n, seq)
 	waitColdChunks(t, db, 1) // the first job published a chunk
 	second := sendJob(db, n, seq)
+	if j := db.coldJobs.Load(); j != 0 {
+		t.Fatalf("cold jobs = %d: the first job completed before being superseded", j)
+	}
 	waitColdJobs(t, db, 1) // the second job replaced it and completed
 	if j := db.coldJobs.Load(); j != 1 {
 		t.Fatalf("cold jobs = %d: the first job completed before being superseded", j)

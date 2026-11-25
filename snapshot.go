@@ -11,7 +11,7 @@ import (
 type Item struct {
 	// Value is owned by the snapshot and must not be modified. It stays
 	// valid while the Snapshot is reachable; without it, until at least the
-	// end of the first compaction that starts after the read (see the
+	// end of the first compaction that completes after the read (see the
 	// package documentation). Copy it to keep it longer.
 	Value   []byte
 	Version uint64 // seq of the batch that last wrote the key

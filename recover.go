@@ -303,13 +303,15 @@ func mapFile(fx fsys.FS, path string, logger zerowrap.Logger) (data []byte, unma
 		return nil, nil, err
 	}
 	size, err := f.Size()
-	if err == nil && size == 0 {
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	if size == 0 {
 		// Nothing to map; openSnapshot reports the empty file.
 		return nil, nil, f.Close()
 	}
-	if err == nil {
-		data, unmap, err = f.Map()
-	}
+	data, unmap, err = f.Map()
 	if err != nil {
 		logger.Warn().Err(err).Str("file", path).Msg("cannot map snapshot, reading it")
 		data, err = readAll(f)
