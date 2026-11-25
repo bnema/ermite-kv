@@ -12,6 +12,10 @@ import (
 // larger than this forms a group of one.
 const maxGroupBytes = 4 << 20
 
+// coldChunk is the number of cold candidates the writer repoints between two
+// commit groups.
+const coldChunk = 1024
+
 // request is a batch waiting for the writer. The writer answers on reply
 // exactly once. Requests are allocated per Apply and never pooled: a pooled
 // channel would be shared across testing/synctest bubbles, and receiving on a
@@ -51,10 +55,15 @@ func (db *DB) writer() {
 		first := pending
 		pending = nil
 		if first == nil {
-			select {
-			case <-db.closing:
+			// Requests go first; pending cold work only runs when none
+			// is ready. A new cold job replaces the pending one: it comes
+			// from a newer snapshot.
+			var ok bool
+			if first, ok = db.next(); !ok {
 				return
-			case first = <-db.reqCh:
+			}
+			if first == nil {
+				continue // cold work was received or applied
 			}
 		}
 		pending = db.collect(first)
@@ -65,6 +74,67 @@ func (db *DB) writer() {
 			return
 		}
 	}
+}
+
+// next waits for the next request. Without cold work it blocks; with cold
+// work pending it applies one chunk when no request is ready. It returns a
+// nil request when it handled cold work instead, and false on close.
+func (db *DB) next() (*request, bool) {
+	if db.cold == nil {
+		select {
+		case <-db.closing:
+			return nil, false
+		case r := <-db.reqCh:
+			return r, true
+		case w := <-db.coldCh:
+			db.cold, db.coldNext = w, 0
+			return nil, true
+		}
+	}
+	select {
+	case <-db.closing:
+		return nil, false
+	case r := <-db.reqCh:
+		return r, true
+	case w := <-db.coldCh:
+		db.cold, db.coldNext = w, 0
+		return nil, true
+	default:
+		db.applyColdChunk()
+		return nil, true
+	}
+}
+
+// applyColdChunk repoints up to coldChunk candidates of db.cold to the
+// mapping and publishes the result with the same seq: readers see the same
+// bytes. A candidate whose key was rewritten or deleted since the snapshot
+// no longer matches its version and is skipped. It runs on the writer
+// between commit groups.
+func (db *DB) applyColdChunk() {
+	w := db.cold
+	end := min(db.coldNext+coldChunk, len(w.cands))
+	cur := db.snap.Load()
+	bld := cur.t.builder()
+	changed := false
+	for _, c := range w.cands[db.coldNext:end] {
+		if bld.setValue(c.key, c.version, c.value, w.m) {
+			changed = true
+		}
+	}
+	if changed {
+		db.snap.Store(newSnapshot(bld.freeze(), cur.seq))
+	}
+	db.coldNext = end
+	db.coldChunks.Add(1)
+	if end == len(w.cands) {
+		db.coldSwapped()
+	}
+}
+
+// coldSwapped ends the cold job: every candidate has been repointed.
+func (db *DB) coldSwapped() {
+	db.cold, db.coldNext = nil, 0
+	db.coldJobs.Add(1)
 }
 
 // collect fills db.group starting with first: it drains the queued requests

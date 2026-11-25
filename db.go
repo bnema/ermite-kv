@@ -103,6 +103,14 @@ type DB struct {
 	retryAt int64  // do not try a log switch again before logSize reaches this
 	buf     []byte // group encoding buffer
 	group   []*request
+
+	// Owned by the writer goroutine: the cold job being applied and the
+	// index of its next candidate.
+	cold     *coldWork
+	coldNext int
+
+	// Test hooks: cold chunks applied and cold jobs completed.
+	coldChunks, coldJobs atomic.Int64
 }
 
 // Open opens the database in dir, creating it (mode 0700) if needed. It

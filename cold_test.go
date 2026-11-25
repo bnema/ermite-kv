@@ -5,7 +5,9 @@ package kv
 import (
 	"bytes"
 	"os"
+	"fmt"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -101,20 +103,6 @@ func TestColdValuesOnOpen(t *testing.T) {
 	}
 }
 
-// receiveCold waits for the next cold work of db.
-func receiveCold(t *testing.T, db *DB) *coldWork {
-	t.Helper()
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	select {
-	case w := <-db.coldCh:
-		return w
-	case <-timer.C:
-		t.Fatal("no cold work")
-	}
-	return nil
-}
-
 // closeBounded closes db and fails if Close does not return in time.
 func closeBounded(t *testing.T, db *DB) {
 	t.Helper()
@@ -144,22 +132,16 @@ func TestColdWorkFromCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := receiveCold(t, db)
-	if w.m == nil || len(w.cands) != 2 {
-		t.Fatalf("cold work = %+v", w)
-	}
-	want := map[string][]byte{"a": big1, "c": big2}
-	for _, c := range w.cands {
-		if !bytes.Equal(c.value, want[string(c.key)]) || c.version != seq {
-			t.Fatalf("candidate %s: version %d (want %d), %d value bytes", c.key, c.version, seq, len(c.value))
+	waitColdJobs(t, db, 1)
+	s := db.Snapshot(bg)
+	checkCold(t, s, "a", big1, true)
+	checkCold(t, s, "b", []byte("small"), false)
+	checkCold(t, s, "c", big2, true)
+	for _, k := range []string{"a", "c"} {
+		it, _ := s.Get(bg, []byte(k))
+		if it.Version != seq || filepath.Base(it.m.name) != snapshotName(seq) {
+			t.Fatalf("%s: version %d, mapping %s", k, it.Version, it.m.name)
 		}
-		delete(want, string(c.key))
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing candidates %v", want)
-	}
-	if filepath.Base(w.m.name) != snapshotName(seq) {
-		t.Fatalf("mapping name = %s", w.m.name)
 	}
 }
 
@@ -169,18 +151,111 @@ func TestColdWorkDisabled(t *testing.T) {
 		mustApply(t, db, i+1)
 	}
 	closeBounded(t, db) // waits for the compactors
-	if n := len(db.coldCh); n != 0 {
-		t.Fatalf("%d cold work sent with ColdValueBytes -1", n)
+	if n := len(db.coldCh) + int(db.coldJobs.Load()) + coldCount(db.Snapshot(bg)); n != 0 {
+		t.Fatalf("cold work seen with ColdValueBytes -1 (%d)", n)
 	}
 }
 
-func TestColdWorkWithoutReaderDoesNotBlockClose(t *testing.T) {
+func TestColdWorkDoesNotBlockClose(t *testing.T) {
 	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1})
 	for i := range 50 {
 		mustApply(t, db, i+1)
 	}
 	closeBounded(t, db)
-	if n := len(db.coldCh); n != 1 {
-		t.Fatalf("coldCh holds %d jobs, want 1", n)
+}
+
+// waitColdJobs waits until db has completed n cold jobs.
+func waitColdJobs(t *testing.T, db *DB, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for db.coldJobs.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("cold jobs done = %d, want %d", db.coldJobs.Load(), n)
+		}
+		runtime.Gosched()
 	}
+}
+
+func TestColdSwapAfterCompaction(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1024})
+	big := bytes.Repeat([]byte("x"), 2000)
+	var b Batch
+	b.Put([]byte("a"), big)
+	b.Put([]byte("b"), []byte("small"))
+	b.Put([]byte("c"), big)
+	if _, err := db.Apply(bg, &b); err != nil {
+		t.Fatal(err)
+	}
+	waitColdJobs(t, db, 1)
+	s := db.Snapshot(bg)
+	checkCold(t, s, "a", big, true)
+	checkCold(t, s, "b", []byte("small"), false)
+	checkCold(t, s, "c", big, true)
+	if s.Seq() != 1 {
+		t.Fatalf("seq = %d", s.Seq())
+	}
+}
+
+func TestColdSwapSkipsStaleCandidates(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
+	m := fakeMapping("OLD-A OLD-B CUR-C")
+	va, vb := putKV(t, db, "a", "old-a"), putKV(t, db, "b", "old-b")
+	vc := putKV(t, db, "c", "cur-c")
+	putKV(t, db, "a", "new-a") // rewritten after the snapshot
+	var b Batch
+	b.Delete([]byte("b")) // deleted after the snapshot
+	if _, err := db.Apply(bg, &b); err != nil {
+		t.Fatal(err)
+	}
+	seq := db.Snapshot(bg).Seq()
+	db.coldCh <- &coldWork{m: m, cands: []coldCand{
+		{key: []byte("a"), version: va, value: m.data[0:5]},
+		{key: []byte("b"), version: vb, value: m.data[6:11]},
+		{key: []byte("c"), version: vc, value: m.data[12:17]},
+	}}
+	waitColdJobs(t, db, 1)
+	s := db.Snapshot(bg)
+	checkCold(t, s, "a", []byte("new-a"), false)
+	mustMissing(t, s, "b")
+	checkCold(t, s, "c", []byte("CUR-C"), true)
+	if s.Seq() != seq {
+		t.Fatalf("seq = %d, want %d", s.Seq(), seq)
+	}
+}
+
+func TestColdSwapInChunks(t *testing.T) {
+	const n = 2500
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1, ColdValueBytes: 1024})
+	val := func(i int) []byte { return bytes.Repeat(fmt.Appendf(nil, "%04d", i), 256) }
+	var b Batch
+	for i := range n {
+		b.Put(treeKey(i), val(i))
+	}
+	if _, err := db.Apply(bg, &b); err != nil {
+		t.Fatal(err)
+	}
+	putKV(t, db, "during", "swap") // a write while the cold job may be pending
+	waitColdJobs(t, db, 1)
+	if c := db.coldChunks.Load(); c < 3 {
+		t.Fatalf("cold chunks = %d, want >= 3", c)
+	}
+	s := db.Snapshot(bg)
+	if got := coldCount(s); got != n {
+		t.Fatalf("coldCount = %d, want %d", got, n)
+	}
+	for i := range n {
+		checkCold(t, s, string(treeKey(i)), val(i), true)
+	}
+	mustGet(t, s, "during", "swap")
+}
+
+func TestCloseWithPendingColdWork(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
+	m := fakeMapping("v")
+	cands := make([]coldCand, 100*coldChunk)
+	for i := range cands {
+		cands[i] = coldCand{key: treeKey(i), version: 1, value: m.data}
+	}
+	db.coldCh <- &coldWork{m: m, cands: cands}
+	closeBounded(t, db)
 }
