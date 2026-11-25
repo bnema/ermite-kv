@@ -34,6 +34,12 @@ type result struct {
 // state. It exits on Close or when the database fails.
 func (db *DB) writer() {
 	defer close(db.done)
+	defer func() {
+		// Drop the pins: after Close the mappings live as long as the
+		// snapshots and items that reference them.
+		db.pins = pins{}
+		db.cold = nil
+	}()
 	var pending *request // dequeued but did not fit in the previous group
 	defer func() {
 		// A request taken but never grouped must still be answered.
@@ -87,7 +93,7 @@ func (db *DB) next() (*request, bool) {
 		case r := <-db.reqCh:
 			return r, true
 		case w := <-db.coldCh:
-			db.cold, db.coldNext = w, 0
+			db.takeCold(w)
 			return nil, true
 		}
 	}
@@ -97,12 +103,21 @@ func (db *DB) next() (*request, bool) {
 	case r := <-db.reqCh:
 		return r, true
 	case w := <-db.coldCh:
-		db.cold, db.coldNext = w, 0
+		db.takeCold(w)
 		return nil, true
 	default:
 		db.applyColdChunk()
 		return nil, true
 	}
+}
+
+// takeCold makes w the pending cold job. It replaces a pending job, whose
+// mapping stays pinned if the tree already references it.
+func (db *DB) takeCold(w *coldWork) {
+	if db.cold != nil && db.coldPublished {
+		db.pins.superseded(db.cold.m)
+	}
+	db.cold, db.coldNext, db.coldPublished = w, 0, false
 }
 
 // applyColdChunk repoints up to coldChunk candidates of db.cold to the
@@ -123,6 +138,7 @@ func (db *DB) applyColdChunk() {
 	}
 	if changed {
 		db.snap.Store(newSnapshot(bld.freeze(), cur.seq))
+		db.coldPublished = true
 	}
 	db.coldNext = end
 	db.coldChunks.Add(1)
@@ -131,10 +147,48 @@ func (db *DB) applyColdChunk() {
 	}
 }
 
-// coldSwapped ends the cold job: every candidate has been repointed.
+// coldSwapped ends the cold job: every candidate has been repointed and its
+// mapping becomes the current generation.
 func (db *DB) coldSwapped() {
-	db.cold, db.coldNext = nil, 0
+	db.pins.swapped(db.cold.m)
+	db.cold, db.coldNext, db.coldPublished = nil, 0, false
 	db.coldJobs.Add(1)
+}
+
+// pins keeps snapshot mappings alive after the tree stops referencing them.
+//
+// A reader may keep a bare value slice (item.Value) without the Item or the
+// Snapshot, and Go does not keep the Item alive for it: such a value is only
+// protected by the references the published trees hold to its mapping. So
+// a mapping referenced by a published snapshot stays pinned until one full
+// swap has completed after it stopped being the current generation:
+//   - gen is the current generation: the mapping Open kept values in, then
+//     the mapping of each completed swap;
+//   - partial holds the mappings of superseded cold jobs that had already
+//     published a chunk, since the tree references them;
+//   - pinned holds the previous generation and the partial mappings it was
+//     swapped out with. The next completed swap releases them.
+//
+// Owned by the writer goroutine; dropped when the writer exits.
+type pins struct {
+	gen     *mapping
+	partial []*mapping
+	pinned  []*mapping
+}
+
+// superseded records that the job of m was replaced after publishing a chunk.
+func (p *pins) superseded(m *mapping) { p.partial = append(p.partial, m) }
+
+// swapped makes m the current generation once its swap is complete: the
+// previous generation and the partial mappings stay pinned until the next
+// swap, anything pinned before is released.
+func (p *pins) swapped(m *mapping) {
+	p.pinned = p.pinned[:0:0]
+	if p.gen != nil {
+		p.pinned = append(p.pinned, p.gen)
+	}
+	p.pinned = append(p.pinned, p.partial...)
+	p.gen, p.partial = m, nil
 }
 
 // collect fills db.group starting with first: it drains the queued requests

@@ -106,8 +106,10 @@ type DB struct {
 
 	// Owned by the writer goroutine: the cold job being applied and the
 	// index of its next candidate.
-	cold     *coldWork
-	coldNext int
+	cold          *coldWork
+	coldNext      int
+	coldPublished bool // a chunk of cold was published: the tree references cold.m
+	pins          pins
 
 	// Test hooks: cold chunks applied and cold jobs completed.
 	coldChunks, coldJobs atomic.Int64
@@ -133,6 +135,7 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 	start := time.Now()
 	log := zerowrap.FromCtxWithFields(ctx, map[string]any{"component": "ermite-kv", "dir": dir})
 	bld := tree{}.builder()
+	var gen *mapping // the snapshot mapping values were kept in, if any
 	rec, err := recoverDir(fx, dir, log,
 		func(key, value []byte, version uint64, m *mapping) {
 			// Keys are always copied to the heap. Large values of a mapped
@@ -141,6 +144,7 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 			// snapshot data alive.
 			if m != nil && opts.ColdValueBytes >= 0 && len(value) >= opts.ColdValueBytes {
 				bld.putMapped(slices.Clone(key), value, version, m)
+				gen = m
 				return
 			}
 			buf := make([]byte, len(key)+len(value))
@@ -174,6 +178,7 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 		file:    rec.log,
 		logBase: rec.logBase,
 		logSize: rec.logSize,
+		pins:    pins{gen: gen},
 	}
 	t := bld.freeze()
 	db.snap.Store(newSnapshot(t, rec.lastSeq))

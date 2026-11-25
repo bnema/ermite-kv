@@ -4,10 +4,12 @@ package kv
 
 import (
 	"bytes"
-	"os"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,4 +260,121 @@ func TestCloseWithPendingColdWork(t *testing.T) {
 	}
 	db.coldCh <- &coldWork{m: m, cands: cands}
 	closeBounded(t, db)
+}
+
+// watchReleases records the names of the mappings released while the test
+// runs.
+func watchReleases(t *testing.T) func(name string) bool {
+	var mu sync.Mutex
+	released := map[string]bool{}
+	f := func(name string) {
+		mu.Lock()
+		released[name] = true
+		mu.Unlock()
+	}
+	onRelease.Store(&f)
+	t.Cleanup(func() { onRelease.Store(nil) })
+	return func(name string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return released[name]
+	}
+}
+
+// compactUntil writes until db has completed n cold jobs. "big" is rewritten
+// with the same value so that every compaction has a cold candidate.
+func compactUntil(t *testing.T, db *DB, n int64, big []byte) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for db.coldJobs.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("cold jobs done = %d, want %d", db.coldJobs.Load(), n)
+		}
+		var b Batch
+		b.Put([]byte("big"), big)
+		if _, err := db.Apply(bg, &b); err != nil {
+			t.Fatal(err)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestLifetimeSnapshotAcrossSwaps(t *testing.T) {
+	dir, big, small := coldDir(t)
+	db := openCold(t, dir, Options{CompactAfter: 1})
+	old := db.Snapshot(bg)
+	checkCold(t, old, "big", big, true)
+	compactUntil(t, db, 1, big)
+	runtime.GC()
+	checkCold(t, old, "big", big, true)
+	checkCold(t, old, "small", small, false)
+	compactUntil(t, db, 2, big)
+	runtime.GC()
+	checkCold(t, old, "big", big, true)
+}
+
+// bareValue returns the value of key without keeping the Item or the Snapshot.
+//
+//go:noinline
+func bareValue(db *DB, key string) []byte {
+	it, _ := db.Snapshot(bg).Get(bg, []byte(key))
+	return it.Value
+}
+
+func TestLifetimeBareValuePinnedForOneSwap(t *testing.T) {
+	released := watchReleases(t)
+	dir, big, _ := coldDir(t)
+	gen0 := filepath.Join(dir, snapshotName(2))
+	// Compaction is off: the test drives each swap itself.
+	db := openCold(t, dir, Options{CompactAfter: -1})
+	v := bareValue(db, "big")
+	swap := func(n int64) {
+		m := &mapping{data: slices.Clone(big), name: fmt.Sprint("swap-", n)}
+		db.coldCh <- &coldWork{m: m, cands: []coldCand{{key: []byte("big"), version: 1, value: m.data}}}
+		waitColdJobs(t, db, n)
+	}
+
+	swap(1) // generation 0 is no longer referenced by the tree, only pinned
+	if it, _ := db.Snapshot(bg).Get(bg, []byte("big")); it.m.name != "swap-1" {
+		t.Fatalf("big still in %s", it.m.name)
+	}
+	for range 5 {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	if released(gen0) {
+		t.Fatal("generation 0 released after one swap")
+	}
+	if !bytes.Equal(v, big) {
+		t.Fatal("bare value changed")
+	}
+
+	swap(2) // releases generation 0
+	deadline := time.Now().Add(10 * time.Second)
+	for !released(gen0) {
+		if time.Now().After(deadline) {
+			t.Fatal("generation 0 not released after two swaps")
+		}
+		runtime.GC()
+		runtime.Gosched()
+	}
+}
+
+func TestPinsBookkeeping(t *testing.T) {
+	g0, a, b, c := fakeMapping("0"), fakeMapping("a"), fakeMapping("b"), fakeMapping("c")
+	p := pins{gen: g0}
+	p.superseded(a) // job a published a chunk, then was replaced by b
+	p.swapped(b)
+	if p.gen != b || !slices.Equal(p.pinned, []*mapping{g0, a}) || p.partial != nil {
+		t.Fatalf("after swap b: %+v", p)
+	}
+	p.swapped(c)
+	if p.gen != c || !slices.Equal(p.pinned, []*mapping{b}) {
+		t.Fatalf("after swap c: %+v", p)
+	}
+	q := pins{} // Open without a mapped value
+	q.swapped(a)
+	if q.gen != a || len(q.pinned) != 0 {
+		t.Fatalf("first swap: %+v", q)
+	}
 }
