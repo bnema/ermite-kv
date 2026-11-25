@@ -16,6 +16,11 @@ const maxGroupBytes = 4 << 20
 // commit groups.
 const coldChunk = 1024
 
+// coldEvery is the number of commit groups after which pending cold work
+// gets a chunk even if requests are waiting, so that it completes under a
+// constant write load.
+const coldEvery = 16
+
 // request is a batch waiting for the writer. The writer answers on reply
 // exactly once. Requests are allocated per Apply and never pooled: a pooled
 // channel would be shared across testing/synctest bubbles, and receiving on a
@@ -58,11 +63,15 @@ func (db *DB) writer() {
 			return
 		default:
 		}
+		if db.cold != nil && db.coldGroups >= coldEvery {
+			db.applyColdChunk()
+			continue
+		}
 		first := pending
 		pending = nil
 		if first == nil {
-			// Requests go first; pending cold work only runs when none
-			// is ready. A new cold job replaces the pending one: it comes
+			// Requests go first; pending cold work runs when none is
+			// ready, or after coldEvery groups. A new cold job replaces the pending one: it comes
 			// from a newer snapshot.
 			var ok bool
 			if first, ok = db.next(); !ok {
@@ -76,6 +85,7 @@ func (db *DB) writer() {
 		if !db.commit() {
 			return
 		}
+		db.coldGroups++
 		if !db.maybeCompact() {
 			return
 		}
@@ -140,7 +150,7 @@ func (db *DB) applyColdChunk() {
 		db.snap.Store(newSnapshot(bld.freeze(), cur.seq))
 		db.coldPublished = true
 	}
-	db.coldNext = end
+	db.coldNext, db.coldGroups = end, 0
 	db.coldChunks.Add(1)
 	if end == len(w.cands) {
 		db.coldSwapped()

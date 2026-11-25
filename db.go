@@ -108,6 +108,7 @@ type DB struct {
 	// index of its next candidate.
 	cold          *coldWork
 	coldNext      int
+	coldGroups    int  // commit groups since the last cold chunk
 	coldPublished bool // a chunk of cold was published: the tree references cold.m
 	pins          pins
 

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -376,5 +377,50 @@ func TestPinsBookkeeping(t *testing.T) {
 	q.swapped(a)
 	if q.gen != a || len(q.pinned) != 0 {
 		t.Fatalf("first swap: %+v", q)
+	}
+}
+
+// TestColdSwapUnderLoad keeps the writer busy: batches over half of
+// maxGroupBytes never share a group, so with several writers a request is
+// always pending and the writer is never idle. The cold job must still
+// complete.
+func TestColdSwapUnderLoad(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: -1, NoSync: true})
+	big := make([]byte, maxGroupBytes/2+1)
+	m := fakeMapping("v")
+	cands := make([]coldCand, 3*coldChunk)
+	for i := range cands {
+		cands[i] = coldCand{key: treeKey(i), version: 1, value: m.data}
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var writes atomic.Int64
+	for g := range 4 {
+		wg.Go(func() {
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var b Batch
+				b.Put(fmt.Appendf(nil, "w%d", g), big)
+				if _, err := db.Apply(bg, &b); err != nil {
+					t.Errorf("apply: %v", err)
+					return
+				}
+				writes.Add(1)
+			}
+		})
+	}
+	db.coldCh <- &coldWork{m: m, cands: cands}
+	waitColdJobs(t, db, 1)
+	close(stop)
+	wg.Wait()
+	if c := db.coldChunks.Load(); c != 3 {
+		t.Fatalf("cold chunks = %d, want 3", c)
+	}
+	if writes.Load() == 0 {
+		t.Fatal("no write succeeded")
 	}
 }

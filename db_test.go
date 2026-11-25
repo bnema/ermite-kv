@@ -1077,8 +1077,8 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base 
 		return false
 	}
 
-	// With cold values, sequential writes leave the writer idle between
-	// requests, so the cold work of their compactions completes.
+	// The power loss usually comes before a swap completes: with cold
+	// values, write until one does, so the variant is never a no-op.
 	if base.ColdValueBytes > 0 {
 		deadline := time.Now().Add(10 * time.Second)
 		for db.coldJobs.Load() == 0 {
