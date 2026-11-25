@@ -732,3 +732,21 @@ func TestRecoverSnapshotIsMapped(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestRecoverEmptySnapshotIsNotMapped(t *testing.T) {
+	fx := faultfs.New()
+	put(fx, snapshotName(1), nil)
+	var buf bytes.Buffer
+	_, rec, err := recoverState(t, fx, bufLogger(&buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release(rec)
+	if n := fx.OpCalls(faultfs.OpMap); n != 0 {
+		t.Fatalf("Map called %d times for an empty snapshot", n)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, "cannot map") || strings.Count(logs, "ignoring invalid snapshot") != 1 {
+		t.Fatalf("logs = %s", logs)
+	}
+}

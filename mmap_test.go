@@ -15,9 +15,9 @@ import (
 
 // mapTempFile maps a temp file holding content. unmapped is set when the
 // mapping's unmap function runs.
-func mapTempFile(t *testing.T, content string) (data []byte, unmap func() error, name string, unmapped *atomic.Bool) {
+func mapTempFile(t *testing.T, content string) (data []byte, unmap func() error, unmapped *atomic.Bool) {
 	t.Helper()
-	name = filepath.Join(t.TempDir(), "snap")
+	name := filepath.Join(t.TempDir(), "snap")
 	if err := os.WriteFile(name, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -31,15 +31,14 @@ func mapTempFile(t *testing.T, content string) (data []byte, unmap func() error,
 		t.Fatal(err)
 	}
 	unmapped = new(atomic.Bool)
-	return data, func() error { unmapped.Store(true); return u() }, name, unmapped
+	return data, func() error { unmapped.Store(true); return u() }, unmapped
 }
 
 func TestMappingReleasedByGC(t *testing.T) {
-	data, unmap, name, unmapped := mapTempFile(t, "cold value")
-	before := mappingsReleased.Load()
-	m := newMapping(data, unmap, name)
-	if string(m.data) != "cold value" || m.name != name {
-		t.Fatalf("mapping = %q %q", m.data, m.name)
+	data, unmap, unmapped := mapTempFile(t, "cold value")
+	m := newMapping(data, unmap)
+	if string(m.data) != "cold value" {
+		t.Fatalf("mapping = %q", m.data)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for !unmapped.Load() {
@@ -49,17 +48,11 @@ func TestMappingReleasedByGC(t *testing.T) {
 		runtime.GC()
 		runtime.Gosched()
 	}
-	for mappingsReleased.Load() <= before { // counter is bumped right after unmap
-		if time.Now().After(deadline) {
-			t.Fatal("mappingsReleased not incremented")
-		}
-		runtime.Gosched()
-	}
 }
 
 func TestMappingKeptWhileReachable(t *testing.T) {
-	data, unmap, name, unmapped := mapTempFile(t, "hot")
-	m := newMapping(data, unmap, name)
+	data, unmap, unmapped := mapTempFile(t, "hot")
+	m := newMapping(data, unmap)
 	for range 5 {
 		runtime.GC()
 		runtime.Gosched()

@@ -84,7 +84,7 @@ func (db *DB) collectCold(f fsys.File, path string, seq uint64) *coldWork {
 		_ = unmap()
 		return &coldWork{}
 	}
-	return &coldWork{m: newMapping(data, unmap, path), cands: cands}
+	return &coldWork{m: newMapping(data, unmap), cands: cands}
 }
 
 // sendCold hands w to the writer through the one-slot db.coldCh. A job still

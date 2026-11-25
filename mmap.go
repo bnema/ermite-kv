@@ -2,18 +2,7 @@
 
 package kv
 
-import (
-	"runtime"
-	"sync/atomic"
-)
-
-// mappingsReleased counts the mappings unmapped by their cleanup. Tests use it
-// to observe the GC-driven release.
-var mappingsReleased atomic.Int64
-
-// onRelease, when set by a test, is called with the name of each mapping
-// released by its cleanup, after the unmap.
-var onRelease atomic.Pointer[func(name string)]
+import "runtime"
 
 // mapping is a whole snapshot file mapped read-only.
 //
@@ -24,24 +13,15 @@ var onRelease atomic.Pointer[func(name string)]
 // also hold the *mapping.
 type mapping struct {
 	data []byte
-	name string // snapshot file the data comes from
 }
 
-// newMapping wraps data, mapped from the file name, and arranges for unmap to
-// run once the mapping is unreachable.
-func newMapping(data []byte, unmap func() error, name string) *mapping {
-	m := &mapping{data: data, name: name}
+// newMapping wraps data, mapped from a snapshot file, and arranges for unmap
+// to run once the mapping is unreachable.
+func newMapping(data []byte, unmap func() error) *mapping {
+	m := &mapping{data: data}
 	// The cleanup must not reference m, or m would never become unreachable.
-	type release struct {
-		unmap func() error
-		name  string
-	}
-	runtime.AddCleanup(m, func(r release) {
-		_ = r.unmap() // no context to report to; the error only leaks the address range
-		mappingsReleased.Add(1)
-		if f := onRelease.Load(); f != nil {
-			(*f)(r.name)
-		}
-	}, release{unmap, name})
+	runtime.AddCleanup(m, func(unmap func() error) {
+		_ = unmap() // no context to report to; the error only leaks the address range
+	}, unmap)
 	return m
 }

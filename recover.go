@@ -149,7 +149,7 @@ func recoverDir(fx fsys.FS, dir string, logger zerowrap.Logger,
 		if load != nil {
 			var m *mapping
 			if unmap != nil {
-				m = newMapping(data, unmap, path)
+				m = newMapping(data, unmap)
 			}
 			view.each(func(key, value []byte, version uint64) { load(key, value, version, m) })
 		} else if unmap != nil {
@@ -302,7 +302,14 @@ func mapFile(fx fsys.FS, path string, logger zerowrap.Logger) (data []byte, unma
 	if err != nil {
 		return nil, nil, err
 	}
-	data, unmap, err = f.Map()
+	size, err := f.Size()
+	if err == nil && size == 0 {
+		// Nothing to map; openSnapshot reports the empty file.
+		return nil, nil, f.Close()
+	}
+	if err == nil {
+		data, unmap, err = f.Map()
+	}
 	if err != nil {
 		logger.Warn().Err(err).Str("file", path).Msg("cannot map snapshot, reading it")
 		data, err = readAll(f)

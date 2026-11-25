@@ -149,8 +149,8 @@ func TestColdWorkFromCompaction(t *testing.T) {
 	checkCold(t, s, "c", big2, true)
 	for _, k := range []string{"a", "c"} {
 		it, _ := s.Get(bg, []byte(k))
-		if it.Version != seq || filepath.Base(it.m.name) != snapshotName(seq) {
-			t.Fatalf("%s: version %d, mapping %s", k, it.Version, it.m.name)
+		if it.Version != seq {
+			t.Fatalf("%s: version %d, want %d", k, it.Version, seq)
 		}
 	}
 }
@@ -231,22 +231,45 @@ func TestColdSwapInChunks(t *testing.T) {
 	mustGet(t, s, "during", "swap")
 }
 
-// watchReleases records the names of the mappings released while the test
-// runs.
-func watchReleases(t *testing.T) func(name string) bool {
-	var mu sync.Mutex
-	released := map[string]bool{}
-	f := func(name string) {
-		mu.Lock()
-		released[name] = true
-		mu.Unlock()
+// watchRelease returns a flag set once m is released by the GC. The caller
+// must not keep m.
+func watchRelease(m *mapping) *atomic.Bool {
+	f := new(atomic.Bool)
+	runtime.AddCleanup(m, func(f *atomic.Bool) { f.Store(true) }, f)
+	return f
+}
+
+// watchItemMapping watches the mapping of the item under key without keeping
+// it.
+//
+//go:noinline
+func watchItemMapping(t *testing.T, db *DB, key string) *atomic.Bool {
+	t.Helper()
+	it, _ := db.Snapshot(bg).Get(bg, []byte(key))
+	if it.m == nil {
+		t.Fatalf("%s is not mapped", key)
 	}
-	onRelease.Store(&f)
-	t.Cleanup(func() { onRelease.Store(nil) })
-	return func(name string) bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return released[name]
+	return watchRelease(it.m)
+}
+
+// waitReleased runs the GC until released is set.
+func waitReleased(t *testing.T, released *atomic.Bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !released.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s not released", what)
+		}
+		runtime.GC()
+		runtime.Gosched()
+	}
+}
+
+// gcSeveral runs the GC a few times.
+func gcSeveral() {
+	for range 5 {
+		runtime.GC()
+		runtime.Gosched()
 	}
 }
 
@@ -291,27 +314,24 @@ func bareValue(db *DB, key string) []byte {
 }
 
 func TestLifetimeBareValuePinnedForOneSwap(t *testing.T) {
-	released := watchReleases(t)
 	dir, big, _ := coldDir(t)
-	gen0 := filepath.Join(dir, snapshotName(2))
 	// Compaction is off: the test drives each swap itself.
 	db := openCold(t, dir, Options{CompactAfter: -1})
+	gen0 := watchItemMapping(t, db, "big")
 	v := bareValue(db, "big")
-	swap := func(n int64) {
-		m := &mapping{data: slices.Clone(big), name: fmt.Sprint("swap-", n)}
+	swap := func(n int64) *mapping {
+		m := &mapping{data: slices.Clone(big)}
 		db.coldCh <- &coldWork{m: m, cands: []coldCand{{key: []byte("big"), version: 1, value: m.data}}}
 		waitColdJobs(t, db, n)
+		return m
 	}
 
-	swap(1) // generation 0 is no longer referenced by the tree, only pinned
-	if it, _ := db.Snapshot(bg).Get(bg, []byte("big")); it.m.name != "swap-1" {
-		t.Fatalf("big still in %s", it.m.name)
+	m1 := swap(1) // generation 0 is no longer referenced by the tree, only pinned
+	if it, _ := db.Snapshot(bg).Get(bg, []byte("big")); it.m != m1 {
+		t.Fatal("big not repointed by the swap")
 	}
-	for range 5 {
-		runtime.GC()
-		runtime.Gosched()
-	}
-	if released(gen0) {
+	gcSeveral()
+	if gen0.Load() {
 		t.Fatal("generation 0 released after one swap")
 	}
 	if !bytes.Equal(v, big) {
@@ -319,14 +339,7 @@ func TestLifetimeBareValuePinnedForOneSwap(t *testing.T) {
 	}
 
 	swap(2) // releases generation 0
-	deadline := time.Now().Add(10 * time.Second)
-	for !released(gen0) {
-		if time.Now().After(deadline) {
-			t.Fatal("generation 0 not released after two swaps")
-		}
-		runtime.GC()
-		runtime.Gosched()
-	}
+	waitReleased(t, gen0, "generation 0 after two swaps")
 }
 
 func TestPinsBookkeeping(t *testing.T) {
@@ -399,22 +412,18 @@ func TestColdSwapUnderLoad(t *testing.T) {
 // TestColdPinsClosedDB checks that Close keeps the pins: a bare value of the
 // previous generation stays valid.
 func TestColdPinsClosedDB(t *testing.T) {
-	released := watchReleases(t)
 	dir, big, _ := coldDir(t)
-	gen0 := filepath.Join(dir, snapshotName(2))
 	db := openCold(t, dir, Options{CompactAfter: -1})
+	gen0 := watchItemMapping(t, db, "big")
 	v := bareValue(db, "big")
-	m := &mapping{data: slices.Clone(big), name: "swap-1"}
+	m := &mapping{data: slices.Clone(big)}
 	db.coldCh <- &coldWork{m: m, cands: []coldCand{{key: []byte("big"), version: 1, value: m.data}}}
 	waitColdJobs(t, db, 1)
 	if err := db.Close(bg); err != nil {
 		t.Fatal(err)
 	}
-	for range 5 {
-		runtime.GC()
-		runtime.Gosched()
-	}
-	if released(gen0) {
+	gcSeveral()
+	if gen0.Load() {
 		t.Fatal("generation 0 released after Close")
 	}
 	if !bytes.Equal(v, big) {
@@ -426,23 +435,15 @@ func TestColdPinsClosedDB(t *testing.T) {
 // TestColdEmptyJobAdvancesPins checks that a compaction without large values
 // still releases the generations before it.
 func TestColdEmptyJobAdvancesPins(t *testing.T) {
-	released := watchReleases(t)
 	dir, _, _ := coldDir(t)
-	gen0 := filepath.Join(dir, snapshotName(2))
 	db := openCold(t, dir, Options{CompactAfter: -1})
+	gen0 := watchItemMapping(t, db, "big")
 	putKV(t, db, "big", "small now") // no later snapshot has a cold value
 	db.coldCh <- &coldWork{}         // what a compaction without candidates sends
 	waitColdJobs(t, db, 1)           // gen0 pinned, no current generation
 	db.coldCh <- &coldWork{}
 	waitColdJobs(t, db, 2) // releases gen0
-	deadline := time.Now().Add(10 * time.Second)
-	for !released(gen0) {
-		if time.Now().After(deadline) {
-			t.Fatal("generation 0 not released after two empty swaps")
-		}
-		runtime.GC()
-		runtime.Gosched()
-	}
+	waitReleased(t, gen0, "generation 0 after two empty swaps")
 }
 
 // TestColdWorkWithoutCandidates checks that compaction sends an empty job
@@ -471,14 +472,21 @@ func fillKeys(t *testing.T, db *DB, n int) uint64 {
 }
 
 // jobFor returns a cold job repointing keys treeKey(0..n-1) at version to a
-// new mapping named name, released through the cleanup like a real one.
-func jobFor(name string, n int, version uint64) *coldWork {
-	m := newMapping([]byte("v"), func() error { return nil }, name)
+// new mapping, and a flag set once that mapping is released.
+func jobFor(n int, version uint64) (*coldWork, *atomic.Bool) {
+	m := &mapping{data: []byte("v")}
 	cands := make([]coldCand, n)
 	for i := range cands {
 		cands[i] = coldCand{key: treeKey(i), version: version, value: m.data}
 	}
-	return &coldWork{m: m, cands: cands}
+	return &coldWork{m: m, cands: cands}, watchRelease(m)
+}
+
+// sendJob sends a job from jobFor without keeping it.
+func sendJob(db *DB, n int, version uint64) *atomic.Bool {
+	w, released := jobFor(n, version)
+	db.coldCh <- w
+	return released
 }
 
 // waitColdChunks waits until db has applied n cold chunks.
@@ -497,7 +505,7 @@ func TestCloseWithPendingColdWork(t *testing.T) {
 	const n = 200 * coldChunk
 	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
 	seq := fillKeys(t, db, n)
-	db.coldCh <- jobFor(t.Name(), n, seq)
+	sendJob(db, n, seq)
 	waitColdChunks(t, db, 1) // the job publishes: it is in progress
 	closeBounded(t, db)
 	if j := db.coldJobs.Load(); j != 0 {
@@ -533,37 +541,25 @@ func TestColdMapFailureKeepsCompacting(t *testing.T) {
 }
 
 func TestColdSupersededPartialJobStaysPinned(t *testing.T) {
-	released := watchReleases(t)
 	const n = 200 * coldChunk
 	db := openCold(t, t.TempDir(), Options{CompactAfter: -1})
 	seq := fillKeys(t, db, n)
-	first, second := t.Name()+"/first", t.Name()+"/second"
-	db.coldCh <- jobFor(first, n, seq)
+	first := sendJob(db, n, seq)
 	waitColdChunks(t, db, 1) // the first job published a chunk
-	db.coldCh <- jobFor(second, n, seq)
+	second := sendJob(db, n, seq)
 	waitColdJobs(t, db, 1) // the second job replaced it and completed
 	if j := db.coldJobs.Load(); j != 1 {
 		t.Fatalf("cold jobs = %d: the first job completed before being superseded", j)
 	}
 	// The tree no longer references the first mapping: only the pins do.
-	for range 5 {
-		runtime.GC()
-		runtime.Gosched()
-	}
-	if released(first) {
+	gcSeveral()
+	if first.Load() {
 		t.Fatal("superseded partial mapping released before the next swap")
 	}
 	db.coldCh <- &coldWork{} // the next swap
 	waitColdJobs(t, db, 2)
-	deadline := time.Now().Add(10 * time.Second)
-	for !released(first) {
-		if time.Now().After(deadline) {
-			t.Fatal("superseded partial mapping not released after the next swap")
-		}
-		runtime.GC()
-		runtime.Gosched()
-	}
-	if released(second) {
+	waitReleased(t, first, "superseded partial mapping after the next swap")
+	if second.Load() {
 		t.Fatal("pinned generation released too early")
 	}
 }

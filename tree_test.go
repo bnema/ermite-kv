@@ -507,7 +507,7 @@ func TestConcurrentReaders(t *testing.T) {
 }
 
 // fakeMapping returns a mapping over heap data, without a cleanup.
-func fakeMapping(data string) *mapping { return &mapping{data: []byte(data), name: "fake"} }
+func fakeMapping(data string) *mapping { return &mapping{data: []byte(data)} }
 
 func treeKey(i int) []byte { return fmt.Appendf(nil, "k%05d", i) }
 
