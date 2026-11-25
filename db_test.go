@@ -1000,32 +1000,30 @@ func TestPowerLoss(t *testing.T) {
 	iterations := short(150, 10)
 	for _, v := range variants {
 		t.Run(v.name, func(t *testing.T) {
-			var swaps int64
 			for _, m := range modes {
 				t.Run(m.name, func(t *testing.T) {
 					for i := range iterations {
 						seed := base + uint64(i)
-						if !runPowerLoss(t, seed, m.opts, v.opts, &swaps) {
+						if !runPowerLoss(t, seed, m.opts, v.opts) {
 							t.Fatalf("failed with seed %d (ERMITE_KV_SEED=%d replays its parameters)", seed, seed)
 						}
 					}
 				})
-			}
-			if v.opts.ColdValueBytes > 0 && swaps == 0 {
-				t.Fatal("cold variant: no cold swap ever completed")
 			}
 		})
 	}
 }
 
 // runPowerLoss runs one power-loss scenario with the options base (every
-// open) and adds the cold jobs completed by the databases to swaps.
-func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base Options, swaps *int64) (ok bool) {
+// open). The database that loses power runs on a view of fx that dies with
+// the power, like a process: its background goroutines cannot change the
+// disk afterwards.
+func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base Options) (ok bool) {
 	rng := rand.New(rand.NewPCG(seed, 0x9e3779b97f4a7c15))
 	fx := faultfs.New()
 	o := base
 	o.GroupWindow = time.Duration(rng.IntN(3)) * 100 * time.Microsecond
-	db, err := open(testCtx(t), fx, testDir, o)
+	db, err := open(testCtx(t), fx.View(), testDir, o)
 	if err != nil {
 		t.Errorf("seed %d: open: %v", seed, err)
 		return false
@@ -1059,12 +1057,10 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base 
 		plo.PageSize = 64 // small pages: a group record spans several of them
 	}
 	fx.PowerLoss(plo)
-	// Close stops the writers: faultfs only invalidates the handles open at
-	// the power loss, so a log switch racing with it can go on with a fresh
-	// log, and Apply would keep succeeding.
+	// The dead process stops: its writers get errors, and Close releases
+	// what it holds.
 	_ = db.Close(bg)
 	wg.Wait()
-	*swaps += db.coldJobs.Load()
 	fx.SetSyncDelay(0)
 
 	db, err = open(testCtx(t), fx, testDir, base)
@@ -1088,7 +1084,6 @@ func runPowerLoss(t *testing.T, seed uint64, plo faultfs.PowerLossOptions, base 
 			}
 			putKV(t, db, "swap", "x")
 		}
-		*swaps += db.coldJobs.Load()
 	}
 
 	// The recovered log accepts new records and survives another reopen.

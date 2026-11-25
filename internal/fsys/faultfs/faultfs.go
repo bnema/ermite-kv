@@ -92,7 +92,8 @@ type nsOp struct {
 
 // FS is an in-memory file system with fault injection.
 type FS struct {
-	mu    sync.Mutex
+	viewMu sync.RWMutex // held for writing by PowerLoss, for reading by View ops
+	mu     sync.Mutex
 	files map[string]*node
 	dirs  map[string]bool
 	locks map[string]bool
@@ -238,6 +239,8 @@ type PowerLossOptions struct {
 // the last SyncDir of their directory are undone. Open handles become invalid
 // and locks are released.
 func (f *FS) PowerLoss(o PowerLossOptions) {
+	f.viewMu.Lock()
+	defer f.viewMu.Unlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if o.PageSize <= 0 {
@@ -719,4 +722,79 @@ func (h *file) Close() error {
 	}
 	h.closed = true
 	return nil
+}
+
+// View returns the file system as seen by one process: every operation fails
+// with ErrPowerLoss once PowerLoss has been called after View, as if the
+// process died with the power. Handles it opened are invalidated by PowerLoss
+// as usual. Without a view, directory operations keep working after a power
+// loss, so a goroutine of the "dead" process could still change the disk.
+func (f *FS) View() fsys.FS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &view{fs: f, epoch: f.epoch}
+}
+
+type view struct {
+	fs    *FS
+	epoch uint64
+}
+
+var _ fsys.FS = (*view)(nil)
+
+// do runs op unless a power loss happened since the view was created. The
+// read lock keeps PowerLoss from running between the check and op.
+func (v *view) do(op func() error) error {
+	v.fs.viewMu.RLock()
+	defer v.fs.viewMu.RUnlock()
+	v.fs.mu.Lock()
+	dead := v.fs.epoch != v.epoch
+	v.fs.mu.Unlock()
+	if dead {
+		return ErrPowerLoss
+	}
+	return op()
+}
+
+func (v *view) OpenFile(name string, flag int, perm os.FileMode) (fsys.File, error) {
+	var h fsys.File
+	err := v.do(func() (err error) {
+		h, err = v.fs.OpenFile(name, flag, perm)
+		return err
+	})
+	return h, err
+}
+
+func (v *view) Rename(oldpath, newpath string) error {
+	return v.do(func() error { return v.fs.Rename(oldpath, newpath) })
+}
+
+func (v *view) Remove(name string) error {
+	return v.do(func() error { return v.fs.Remove(name) })
+}
+
+func (v *view) ReadDir(dir string) ([]string, error) {
+	var names []string
+	err := v.do(func() (err error) {
+		names, err = v.fs.ReadDir(dir)
+		return err
+	})
+	return names, err
+}
+
+func (v *view) MkdirAll(dir string, perm os.FileMode) error {
+	return v.do(func() error { return v.fs.MkdirAll(dir, perm) })
+}
+
+func (v *view) SyncDir(dir string) error {
+	return v.do(func() error { return v.fs.SyncDir(dir) })
+}
+
+func (v *view) Lock(path string) (io.Closer, error) {
+	var c io.Closer
+	err := v.do(func() (err error) {
+		c, err = v.fs.Lock(path)
+		return err
+	})
+	return c, err
 }

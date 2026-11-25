@@ -570,3 +570,44 @@ func TestFailOpMap(t *testing.T) {
 		t.Fatalf("String = %q", s)
 	}
 }
+
+func TestViewDiesWithPowerLoss(t *testing.T) {
+	f := New()
+	v := f.View()
+	if err := v.MkdirAll("/d", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h, err := v.OpenFile("/d/a", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, h, "x")
+	for _, d := range []string{"/", "/d"} {
+		if err := v.SyncDir(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.PowerLoss(PowerLossOptions{})
+	checks := map[string]error{
+		"Rename":   v.Rename("/d/a", "/d/b"),
+		"Remove":   v.Remove("/d/a"),
+		"MkdirAll": v.MkdirAll("/e", 0o700),
+		"SyncDir":  v.SyncDir("/d"),
+	}
+	_, checks["OpenFile"] = v.OpenFile("/d/a", os.O_RDONLY, 0)
+	_, checks["ReadDir"] = v.ReadDir("/d")
+	_, checks["Lock"] = v.Lock("/d/LOCK")
+	_, checks["Write"] = h.Write([]byte("y"))
+	for op, err := range checks {
+		if !errors.Is(err, ErrPowerLoss) {
+			t.Errorf("%s after power loss = %v, want ErrPowerLoss", op, err)
+		}
+	}
+	// The disk itself and a new view still work.
+	if _, err := f.View().OpenFile("/d/a", os.O_RDONLY, 0); err != nil {
+		t.Fatalf("new view: %v", err)
+	}
+	if err := f.Remove("/d/a"); err != nil {
+		t.Fatalf("FS after power loss: %v", err)
+	}
+}
