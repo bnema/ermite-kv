@@ -382,27 +382,25 @@ func TestPinsBookkeeping(t *testing.T) {
 
 // TestColdSwapUnderLoad keeps the writer busy: batches over half of
 // maxGroupBytes never share a group, so with several writers a request is
-// always pending and the writer is never idle. The cold job must still
-// complete.
+// always pending and the writer is never idle. The cold job, sent once the
+// writers are saturated, must still complete before a bounded number of
+// batches (each batch writes about 2 MB).
 func TestColdSwapUnderLoad(t *testing.T) {
+	const chunks = 2
+	const saturated = 8                           // batches before the job is sent
+	const budget = saturated + 3*coldEvery*chunks // total batches
 	db := openCold(t, t.TempDir(), Options{CompactAfter: -1, NoSync: true})
 	big := make([]byte, maxGroupBytes/2+1)
 	m := fakeMapping("v")
-	cands := make([]coldCand, 3*coldChunk)
+	cands := make([]coldCand, (chunks-1)*coldChunk+1)
 	for i := range cands {
 		cands[i] = coldCand{key: treeKey(i), version: 1, value: m.data}
 	}
-	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	var writes atomic.Int64
+	var started, writes atomic.Int64
 	for g := range 4 {
 		wg.Go(func() {
-			for i := 0; ; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-				}
+			for started.Add(1) <= budget {
 				var b Batch
 				b.Put(fmt.Appendf(nil, "w%d", g), big)
 				if _, err := db.Apply(bg, &b); err != nil {
@@ -413,14 +411,79 @@ func TestColdSwapUnderLoad(t *testing.T) {
 			}
 		})
 	}
-	db.coldCh <- &coldWork{m: m, cands: cands}
-	waitColdJobs(t, db, 1)
-	close(stop)
-	wg.Wait()
-	if c := db.coldChunks.Load(); c != 3 {
-		t.Fatalf("cold chunks = %d, want 3", c)
+	deadline := time.Now().Add(10 * time.Second)
+	for writes.Load() < saturated {
+		if time.Now().After(deadline) {
+			t.Fatal("writers not saturated")
+		}
+		runtime.Gosched()
 	}
-	if writes.Load() == 0 {
-		t.Fatal("no write succeeded")
+	db.coldCh <- &coldWork{m: m, cands: cands}
+	wg.Wait()
+	if j := db.coldJobs.Load(); j != 1 {
+		t.Fatalf("cold jobs = %d after %d batches, want 1", j, budget)
+	}
+	if c := db.coldChunks.Load(); c != chunks {
+		t.Fatalf("cold chunks = %d, want %d", c, chunks)
+	}
+}
+
+// TestColdPinsClosedDB checks that Close keeps the pins: a bare value of the
+// previous generation stays valid.
+func TestColdPinsClosedDB(t *testing.T) {
+	released := watchReleases(t)
+	dir, big, _ := coldDir(t)
+	gen0 := filepath.Join(dir, snapshotName(2))
+	db := openCold(t, dir, Options{CompactAfter: -1})
+	v := bareValue(db, "big")
+	m := &mapping{data: slices.Clone(big), name: "swap-1"}
+	db.coldCh <- &coldWork{m: m, cands: []coldCand{{key: []byte("big"), version: 1, value: m.data}}}
+	waitColdJobs(t, db, 1)
+	if err := db.Close(bg); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	if released(gen0) {
+		t.Fatal("generation 0 released after Close")
+	}
+	if !bytes.Equal(v, big) {
+		t.Fatal("bare value changed")
+	}
+	runtime.KeepAlive(db)
+}
+
+// TestColdEmptyJobAdvancesPins checks that a compaction without large values
+// still releases the generations before it.
+func TestColdEmptyJobAdvancesPins(t *testing.T) {
+	released := watchReleases(t)
+	dir, _, _ := coldDir(t)
+	gen0 := filepath.Join(dir, snapshotName(2))
+	db := openCold(t, dir, Options{CompactAfter: -1})
+	putKV(t, db, "big", "small now") // no later snapshot has a cold value
+	db.coldCh <- &coldWork{}         // what a compaction without candidates sends
+	waitColdJobs(t, db, 1)           // gen0 pinned, no current generation
+	db.coldCh <- &coldWork{}
+	waitColdJobs(t, db, 2) // releases gen0
+	deadline := time.Now().Add(10 * time.Second)
+	for !released(gen0) {
+		if time.Now().After(deadline) {
+			t.Fatal("generation 0 not released after two empty swaps")
+		}
+		runtime.GC()
+		runtime.Gosched()
+	}
+}
+
+// TestColdWorkWithoutCandidates checks that compaction sends an empty job
+// when the new snapshot has no large value.
+func TestColdWorkWithoutCandidates(t *testing.T) {
+	db := openCold(t, t.TempDir(), Options{CompactAfter: 1})
+	putKV(t, db, "a", "small")
+	waitColdJobs(t, db, 1)
+	if n := coldCount(db.Snapshot(bg)); n != 0 {
+		t.Fatalf("coldCount = %d", n)
 	}
 }

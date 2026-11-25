@@ -205,6 +205,10 @@ func (db *DB) Close(ctx context.Context) error {
 		<-db.done            // the writer finishes its group and exits
 		db.compactors.Wait() // an in-flight compaction is not cancelled
 		select {
+		case <-db.coldCh: // sent during Close: the writer will never take it
+		default:
+		}
+		select {
 		case <-db.failed:
 			err = db.failErr
 		default:

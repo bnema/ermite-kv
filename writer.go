@@ -39,12 +39,6 @@ type result struct {
 // state. It exits on Close or when the database fails.
 func (db *DB) writer() {
 	defer close(db.done)
-	defer func() {
-		// Drop the pins: after Close the mappings live as long as the
-		// snapshots and items that reference them.
-		db.pins = pins{}
-		db.cold = nil
-	}()
 	var pending *request // dequeued but did not fit in the previous group
 	defer func() {
 		// A request taken but never grouped must still be answered.
@@ -63,6 +57,13 @@ func (db *DB) writer() {
 			return
 		default:
 		}
+		// Take new cold work here too: next is skipped while a request is
+		// pending.
+		select {
+		case w := <-db.coldCh:
+			db.takeCold(w)
+		default:
+		}
 		if db.cold != nil && db.coldGroups >= coldEvery {
 			db.applyColdChunk()
 			continue
@@ -71,8 +72,8 @@ func (db *DB) writer() {
 		pending = nil
 		if first == nil {
 			// Requests go first; pending cold work runs when none is
-			// ready, or after coldEvery groups. A new cold job replaces the pending one: it comes
-			// from a newer snapshot.
+			// ready, or after coldEvery groups. A new cold job replaces
+			// the pending one: it comes from a newer snapshot.
 			var ok bool
 			if first, ok = db.next(); !ok {
 				return
@@ -127,14 +128,14 @@ func (db *DB) takeCold(w *coldWork) {
 	if db.cold != nil && db.coldPublished {
 		db.pins.superseded(db.cold.m)
 	}
-	db.cold, db.coldNext, db.coldPublished = w, 0, false
+	db.cold, db.coldNext, db.coldPublished, db.coldGroups = w, 0, false, 0
 }
 
 // applyColdChunk repoints up to coldChunk candidates of db.cold to the
 // mapping and publishes the result with the same seq: readers see the same
 // bytes. A candidate whose key was rewritten or deleted since the snapshot
 // no longer matches its version and is skipped. It runs on the writer
-// between commit groups.
+// between commit groups. A job without candidates (m nil) completes at once.
 func (db *DB) applyColdChunk() {
 	w := db.cold
 	end := min(db.coldNext+coldChunk, len(w.cands))
@@ -158,7 +159,7 @@ func (db *DB) applyColdChunk() {
 }
 
 // coldSwapped ends the cold job: every candidate has been repointed and its
-// mapping becomes the current generation.
+// mapping (nil for a job without candidates) becomes the current generation.
 func (db *DB) coldSwapped() {
 	db.pins.swapped(db.cold.m)
 	db.cold, db.coldNext, db.coldPublished = nil, 0, false
@@ -179,7 +180,9 @@ func (db *DB) coldSwapped() {
 //   - pinned holds the previous generation and the partial mappings it was
 //     swapped out with. The next completed swap releases them.
 //
-// Owned by the writer goroutine; dropped when the writer exits.
+// Owned by the writer goroutine. The pins stay after the writer exits (Close
+// or failure) and live as long as the DB is reachable, since no swap can
+// release them anymore.
 type pins struct {
 	gen     *mapping
 	partial []*mapping
@@ -193,7 +196,7 @@ func (p *pins) superseded(m *mapping) { p.partial = append(p.partial, m) }
 // previous generation and the partial mappings stay pinned until the next
 // swap, anything pinned before is released.
 func (p *pins) swapped(m *mapping) {
-	p.pinned = p.pinned[:0:0]
+	p.pinned = nil // a [:0:0] slice would still hold the old backing array
 	if p.gen != nil {
 		p.pinned = append(p.pinned, p.gen)
 	}

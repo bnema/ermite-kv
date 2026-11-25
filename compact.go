@@ -159,9 +159,10 @@ type coldCand struct {
 }
 
 // coldWork maps the synced snapshot file f, stored at path, and collects its
-// values of at least Options.ColdValueBytes. It returns nil when the option
-// is disabled, when there is no such value, or on failure, which only logs a
-// warning: the compaction itself has succeeded.
+// values of at least Options.ColdValueBytes. Without such a value it returns
+// an empty job (nil m), which still advances the pins. It returns nil when
+// the option is disabled or on failure, which only logs a warning: the
+// compaction itself has succeeded.
 func (db *DB) coldWork(f fsys.File, path string, seq uint64) *coldWork {
 	if db.opts.ColdValueBytes < 0 {
 		return nil
@@ -187,8 +188,10 @@ func (db *DB) coldWork(f fsys.File, path string, seq uint64) *coldWork {
 		}
 	})
 	if len(cands) == 0 {
+		// A job without candidates still advances the pins: the previous
+		// generations, whose files compaction removed, get released.
 		_ = unmap()
-		return nil
+		return &coldWork{}
 	}
 	return &coldWork{m: newMapping(data, unmap, path), cands: cands}
 }
