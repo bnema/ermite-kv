@@ -46,8 +46,10 @@ type Options struct {
 	// group. 0 means it only drains what is already queued.
 	GroupWindow time.Duration
 	// ColdValueBytes is the value size from which Open and compaction serve
-	// a value from the mmapped snapshot instead of the heap. 0 means 1 KiB;
-	// a negative value keeps every value on the heap.
+	// a value from the memory-mapped snapshot instead of the heap. 0 means
+	// 1 KiB. A negative value keeps every value on the heap; Open still
+	// reads the snapshot through a read-only mapping and copies the values,
+	// so the operation rules of the package documentation still apply.
 	ColdValueBytes int
 }
 

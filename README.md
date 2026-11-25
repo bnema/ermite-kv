@@ -17,7 +17,7 @@
 - Data in memory, persisted to an append-only log with snapshots
 - One writer groups commits into a single `fsync`
 - Lock-free reads from immutable snapshots
-- Large values (1 KiB and up, `Options.ColdValueBytes`) served from the memory-mapped snapshot file instead of the heap once they are in a snapshot (at open, or after the next compaction); newer values stay on the heap until then
+- Large values (1 KiB and up, `Options.ColdValueBytes`) served from the memory-mapped snapshot file once they are in a snapshot (at open, or after the next compaction); keys, smaller values and values written since the last compaction are on the heap
 - Conditional writes (`RequireAbsent`, `RequireVersion`)
 - Standard library only, plus [zerowrap](https://git.bnema.dev/zerowrap) for logs
 
@@ -54,7 +54,7 @@ Durability, visibility and value lifetime guarantees are in the package document
 - Only the database writes its directory: never modify, truncate or replace its files while it is open.
 - A disk I/O error while reading a memory-mapped value raises `SIGBUS` and crashes the process.
 - Mapped values live in the page cache: file-backed, reclaimable memory, not heap.
-- `Item.Value` stays valid while you hold the `Item` or its `Snapshot`, and for at least one more compaction; copy values you keep longer.
+- A value stays valid while its `Snapshot` is reachable. Without the `Snapshot`, it stays valid at least until the end of the first compaction that starts after the read, and while the database is reachable once closed or failed. Copy values you keep longer (`bytes.Clone`, `string(v)`).
 
 ## Test
 

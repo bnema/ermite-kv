@@ -10,8 +10,9 @@ import (
 // Item is the value stored under a key.
 type Item struct {
 	// Value is owned by the snapshot and must not be modified. It stays
-	// valid while the Item or its Snapshot is held, and for at least one
-	// more compaction after that; copy it to keep it longer.
+	// valid while the Snapshot is reachable; without it, until at least the
+	// end of the first compaction that starts after the read (see the
+	// package documentation). Copy it to keep it longer.
 	Value   []byte
 	Version uint64 // seq of the batch that last wrote the key
 

@@ -21,10 +21,13 @@
 //     modified.
 //   - Values of at least Options.ColdValueBytes (1 KiB by default) are
 //     served from the memory-mapped snapshot file once they are in a
-//     snapshot (at Open, or after the next compaction); until then, and for
-//     smaller values and all keys, they are heap memory. Item.Value stays valid while the caller holds
-//     the Item or its Snapshot, and for at least one more compaction after
-//     that. A value kept longer must be copied (bytes.Clone, string(v)).
+//     snapshot (at Open, or after the next compaction). Keys, smaller
+//     values and values written since the last compaction are on the heap.
+//   - A value read from the DB stays valid while its Snapshot is reachable.
+//     Without the Snapshot, it stays valid at least until the end of the
+//     first compaction that starts after the read, and while the DB is
+//     reachable once it is closed or failed. Copy a value (bytes.Clone,
+//     string(v)) to use it longer.
 //   - ErrFailed means a write or sync failed. The outcome of the batches in
 //     that commit group is unknown (they may be replayed by the next Open);
 //     every later Apply fails, while reads keep serving the last snapshot.

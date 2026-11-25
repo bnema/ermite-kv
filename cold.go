@@ -190,6 +190,10 @@ func (db *DB) coldSwapped() {
 //   - pinned holds the previous generation and the partial mappings it was
 //     swapped out with. The next completed swap releases them.
 //
+// A value read while a mapping is current is released at the earliest by the
+// second swap after the read, which ends the first compaction that started
+// after the read: the lifetime documented on Item.Value.
+//
 // Owned by the writer goroutine. The pins stay after the writer exits (Close
 // or failure) and live as long as the DB is reachable, since no swap can
 // release them anymore.
