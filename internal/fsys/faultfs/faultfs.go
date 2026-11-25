@@ -47,6 +47,7 @@ const (
 	OpRemove
 	OpTruncate
 	OpOpenFile
+	OpMap
 	numOps
 )
 
@@ -62,6 +63,8 @@ func (k OpKind) String() string {
 		return "Truncate"
 	case OpOpenFile:
 		return "OpenFile"
+	case OpMap:
+		return "Map"
 	}
 	return "unknown"
 }
@@ -625,6 +628,9 @@ func (h *file) Map() ([]byte, func() error, error) {
 	defer h.fs.mu.Unlock()
 	if err := h.check(); err != nil {
 		return nil, nil, err
+	}
+	if err := h.fs.injected(OpMap); err != nil {
+		return nil, nil, &fs.PathError{Op: "mmap", Err: err}
 	}
 	if !h.read {
 		return nil, nil, &fs.PathError{Op: "mmap", Err: fs.ErrPermission}

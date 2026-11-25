@@ -547,3 +547,26 @@ func TestMap(t *testing.T) {
 		t.Fatalf("Map after power loss = %v", err)
 	}
 }
+
+func TestFailOpMap(t *testing.T) {
+	f := New()
+	h := create(t, f, "/m")
+	write(t, h, "x")
+	boom := errors.New("boom")
+	f.FailOp(OpMap, 1, boom)
+	if _, _, err := h.Map(); !errors.Is(err, boom) {
+		t.Fatalf("Map = %v", err)
+	}
+	if data, _, err := h.Map(); err != nil || string(data) != "x" {
+		t.Fatalf("faults fire once: %q %v", data, err)
+	}
+	if n := f.OpCalls(OpMap); n != 2 {
+		t.Fatalf("OpCalls(OpMap) = %d", n)
+	}
+	if n := f.OpCalls(OpOpenFile); n != 1 {
+		t.Fatalf("OpCalls(OpOpenFile) = %d", n)
+	}
+	if s := OpMap.String(); s != "Map" {
+		t.Fatalf("String = %q", s)
+	}
+}
