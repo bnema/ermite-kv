@@ -19,10 +19,13 @@ const (
 
 // entry is a key with its value and the seq of the batch that last wrote it.
 // The tree never copies or modifies key and value: callers pass owned slices.
+// key is always a heap slice. When m is set, value is a slice of m.data and the
+// entry keeps the mapping alive; a nil m means value is on the heap.
 type entry struct {
 	key     []byte
 	value   []byte
 	version uint64
+	m       *mapping
 }
 
 // owner identifies one builder epoch. It has a non-zero size so that every
@@ -78,7 +81,7 @@ func (t tree) len() int { return t.n }
 
 func (t tree) get(key []byte) (Item, bool) {
 	e, ok := lookup(t.root, key)
-	return Item{Value: e.value, Version: e.version}, ok
+	return Item{Value: e.value, Version: e.version, m: e.m}, ok
 }
 
 // put returns a tree where key maps to value at version; t is untouched.
@@ -131,7 +134,7 @@ func (t tree) ascend(start, end []byte) iter.Seq2[[]byte, Item] {
 			if end != nil && bytes.Compare(e.key, end) >= 0 {
 				return
 			}
-			if !yield(e.key, Item{Value: e.value, Version: e.version}) {
+			if !yield(e.key, Item{Value: e.value, Version: e.version, m: e.m}) {
 				return
 			}
 			// Descend to the leftmost leaf of the subtree right of e.
@@ -170,7 +173,7 @@ func (b *builder) len() int { return b.n }
 
 func (b *builder) get(key []byte) (Item, bool) {
 	e, ok := lookup(b.root, key)
-	return Item{Value: e.value, Version: e.version}, ok
+	return Item{Value: e.value, Version: e.version, m: e.m}, ok
 }
 
 // mutable returns n if this builder owns it, else an owned shallow copy.
@@ -209,7 +212,35 @@ func (b *builder) split(n *node, i int) (entry, *node) {
 
 // put sets key to value at version, replacing any existing entry.
 func (b *builder) put(key, value []byte, version uint64) {
-	e := entry{key: key, value: value, version: version}
+	b.putEntry(entry{key: key, value: value, version: version})
+}
+
+// putMapped is put for a value that is a slice of m.data. key must still be an
+// owned heap slice.
+func (b *builder) putMapped(key, value []byte, version uint64, m *mapping) {
+	b.putEntry(entry{key: key, value: value, version: version, m: m})
+}
+
+// setValue replaces the value and mapping of key if its entry has exactly
+// version, keeping the entry's key slice, and reports whether it did. Only
+// the nodes on the path to the entry are cloned.
+func (b *builder) setValue(key []byte, version uint64, value []byte, m *mapping) bool {
+	if e, ok := lookup(b.root, key); !ok || e.version != version {
+		return false
+	}
+	b.root = b.mutable(b.root)
+	for n := b.root; ; {
+		i, found := n.find(key)
+		if found {
+			n.entries[i].value = value
+			n.entries[i].m = m
+			return true
+		}
+		n = b.mutableChild(n, i)
+	}
+}
+
+func (b *builder) putEntry(e entry) {
 	if b.root == nil {
 		b.root = &node{own: b.own, entries: []entry{e}}
 		b.n = 1

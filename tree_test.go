@@ -505,3 +505,96 @@ func TestConcurrentReaders(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// fakeMapping returns a mapping over heap data, without a cleanup.
+func fakeMapping(data string) *mapping { return &mapping{data: []byte(data), name: "fake"} }
+
+func treeKey(i int) []byte { return fmt.Appendf(nil, "k%05d", i) }
+
+func TestTreeSetValue(t *testing.T) {
+	const n = 500
+	b := tree{}.builder()
+	for i := range n {
+		b.put(treeKey(i), []byte("heap"), uint64(i+1))
+	}
+	old := b.freeze()
+	m := fakeMapping("cold value")
+
+	for _, i := range []int{0, 37, n / 2, n - 1} {
+		k := treeKey(i)
+		before, _ := lookup(b.root, k)
+		if !b.setValue(slices.Clone(k), uint64(i+1), m.data[:4], m) {
+			t.Fatalf("setValue(%s) = false", k)
+		}
+		after, _ := lookup(b.root, k)
+		if &after.key[0] != &before.key[0] {
+			t.Fatalf("setValue(%s) replaced the key slice", k)
+		}
+		if it, _ := b.get(k); string(it.Value) != "cold" || it.m != m || it.Version != uint64(i+1) {
+			t.Fatalf("get(%s) = %+v", k, it)
+		}
+	}
+	if b.setValue(treeKey(1), 999, nil, m) {
+		t.Fatal("setValue with a different version = true")
+	}
+	if b.setValue([]byte("missing"), 1, nil, m) {
+		t.Fatal("setValue on a missing key = true")
+	}
+	if it, _ := b.get(treeKey(1)); string(it.Value) != "heap" || it.m != nil {
+		t.Fatalf("failed setValue changed the entry: %+v", it)
+	}
+	if b.len() != n {
+		t.Fatalf("len = %d", b.len())
+	}
+
+	// The tree frozen before is unchanged.
+	for i := range n {
+		it, ok := old.get(treeKey(i))
+		if !ok || string(it.Value) != "heap" || it.m != nil {
+			t.Fatalf("frozen get(%d) = %+v %v", i, it, ok)
+		}
+	}
+
+	cur := b.freeze()
+	var mapped int
+	for k, it := range cur.ascend(nil, nil) {
+		if it.m != nil {
+			if it.m != m || string(it.Value) != "cold" {
+				t.Fatalf("ascend %s = %+v", k, it)
+			}
+			mapped++
+		}
+	}
+	if mapped != 4 {
+		t.Fatalf("ascend saw %d mapped items, want 4", mapped)
+	}
+}
+
+func TestTreePutMapped(t *testing.T) {
+	m := fakeMapping("abcdef")
+	b := tree{}.builder()
+	for i := range 300 {
+		if i%3 == 0 {
+			b.putMapped(treeKey(i), m.data[1:3], uint64(i), m)
+		} else {
+			b.put(treeKey(i), []byte("v"), uint64(i))
+		}
+	}
+	tr := b.freeze()
+	for i := range 300 {
+		it, ok := tr.get(treeKey(i))
+		switch {
+		case !ok:
+			t.Fatalf("get(%d) missing", i)
+		case i%3 == 0 && (it.m != m || string(it.Value) != "bc"):
+			t.Fatalf("get(%d) = %+v", i, it)
+		case i%3 != 0 && it.m != nil:
+			t.Fatalf("get(%d) has a mapping", i)
+		}
+	}
+	for k, it := range tr.ascend(treeKey(0), treeKey(1)) {
+		if it.m != m {
+			t.Fatalf("ascend %s: m = %p", k, it.m)
+		}
+	}
+}

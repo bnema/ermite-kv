@@ -11,6 +11,8 @@ import (
 type Item struct {
 	Value   []byte // owned by the snapshot: must not be modified
 	Version uint64 // seq of the batch that last wrote the key
+
+	m *mapping // keeps the snapshot mapping alive while Value aliases it
 }
 
 // Snapshot is an immutable, consistent view of the database at one seq. It is
