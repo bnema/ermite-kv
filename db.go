@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,9 +125,15 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 	log := zerowrap.FromCtxWithFields(ctx, map[string]any{"component": "ermite-kv", "dir": dir})
 	bld := tree{}.builder()
 	rec, err := recoverDir(fx, dir, log,
-		func(key, value []byte, version uint64, _ *mapping) {
-			// Snapshot entries alias the snapshot file data: copy them so
-			// the tree does not keep it alive.
+		func(key, value []byte, version uint64, m *mapping) {
+			// Keys are always copied to the heap. Large values of a mapped
+			// snapshot stay in the mapping, which their entry keeps alive;
+			// other values are copied so the tree does not keep the
+			// snapshot data alive.
+			if m != nil && opts.ColdValueBytes >= 0 && len(value) >= opts.ColdValueBytes {
+				bld.putMapped(slices.Clone(key), value, version, m)
+				return
+			}
 			buf := make([]byte, len(key)+len(value))
 			n := copy(buf, key)
 			copy(buf[n:], value)
