@@ -124,9 +124,9 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 	log := zerowrap.FromCtxWithFields(ctx, map[string]any{"component": "ermite-kv", "dir": dir})
 	bld := tree{}.builder()
 	rec, err := recoverDir(fx, dir, log,
-		func(key, value []byte, version uint64) {
-			// Snapshot entries alias one shared file buffer: copy them so
-			// the tree does not keep the whole buffer alive.
+		func(key, value []byte, version uint64, _ *mapping) {
+			// Snapshot entries alias the snapshot file data: copy them so
+			// the tree does not keep it alive.
 			buf := make([]byte, len(key)+len(value))
 			n := copy(buf, key)
 			copy(buf[n:], value)

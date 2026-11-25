@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"bnema.dev/zerowrap"
 
@@ -28,7 +30,7 @@ type state struct {
 	seqs     []uint64 // seqs passed to apply, in order
 }
 
-func (s *state) load(k, v []byte, ver uint64) {
+func (s *state) load(k, v []byte, ver uint64, _ *mapping) {
 	s.m[string(k)] = string(v)
 	s.versions[string(k)] = ver
 }
@@ -499,7 +501,7 @@ func TestRecoverSnapshotLoadOrderAndOwnership(t *testing.T) {
 	put(fx, snapshotName(1), snapshotBytes(t, 1, snapEnt("a", "1", 1), snapEnt("b", "2", 1), snapEnt("c", "3", 1)))
 	var keys []string
 	var held [][]byte
-	_, err := recoverDir(fx, testDir, noLog, func(k, v []byte, ver uint64) {
+	_, err := recoverDir(fx, testDir, noLog, func(k, v []byte, ver uint64, _ *mapping) {
 		keys = append(keys, string(k))
 		held = append(held, k, v)
 	}, nil)
@@ -667,5 +669,66 @@ func TestRecoverDamagedLenIsTornTail(t *testing.T) {
 				t.Fatalf("rec = %+v", rec)
 			}
 		})
+	}
+}
+
+func TestRecoverSnapshotMapFailureFallsBackToRead(t *testing.T) {
+	fx := faultfs.New()
+	put(fx, snapshotName(1), snapshotBytes(t, 1, snapEnt("a", "1", 1), snapEnt("b", "2", 1)))
+	fx.FailOp(faultfs.OpMap, 1, nil)
+	var buf bytes.Buffer
+	s := &state{m: map[string]string{}, versions: map[string]uint64{}}
+	var mapped int
+	rec, err := recoverDir(fx, testDir, bufLogger(&buf), func(k, v []byte, ver uint64, m *mapping) {
+		if m != nil {
+			mapped++
+		}
+		s.load(k, v, ver, m)
+	}, s.apply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release(rec)
+	wantState(t, s, map[string]string{"a": "1", "b": "2"})
+	if mapped != 0 || rec.snapSeq != 1 {
+		t.Fatalf("mapped = %d, rec = %+v", mapped, rec)
+	}
+	if !strings.Contains(buf.String(), "cannot map snapshot") {
+		t.Fatalf("no map warning in %q", buf.String())
+	}
+}
+
+func TestRecoverSnapshotIsMapped(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "db")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snap := snapshotBytes(t, 1, snapEnt("a", "first", 1), snapEnt("b", "second", 1))
+	if err := os.WriteFile(filepath.Join(dir, snapshotName(1)), snap, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var ms []*mapping
+	got := map[string]string{}
+	rec, err := recoverDir(fsys.OS(), dir, noLog, func(k, v []byte, _ uint64, m *mapping) {
+		if m == nil {
+			t.Fatalf("load(%s): nil mapping", k)
+		}
+		start := uintptr(unsafe.Pointer(unsafe.SliceData(m.data)))
+		p := uintptr(unsafe.Pointer(unsafe.SliceData(v)))
+		if p < start || p+uintptr(len(v)) > start+uintptr(len(m.data)) {
+			t.Fatalf("load(%s): value does not alias the mapping", k)
+		}
+		ms = append(ms, m)
+		got[string(k)] = string(v)
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release(rec)
+	if len(ms) != 2 || ms[0] != ms[1] {
+		t.Fatalf("mappings = %v, want one shared mapping", ms)
+	}
+	if !bytes.Equal(ms[0].data, snap) || got["a"] != "first" || got["b"] != "second" {
+		t.Fatalf("got %v", got)
 	}
 }

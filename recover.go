@@ -65,13 +65,16 @@ type recovered struct {
 // newer than the snapshot, in seq order (a record that straddles the snapshot
 // seq contributes only its newer batches). The ops passed to apply are freshly
 // allocated and the callee may retain them but must not modify them. load
-// receives slices of one shared read-only buffer: it must copy what it keeps.
+// receives read-only slices of the snapshot file: key must always be copied.
+// When m is non-nil, value aliases m.data and is only valid while m is
+// reachable; when m is nil, value is in a shared heap buffer and must be
+// copied too.
 // Either callback may be nil. A zero logger discards logs.
 //
 // On error nothing stays open or locked. ErrLocked and ErrCorrupt are
 // returned wrapped.
 func recoverDir(fx fsys.FS, dir string, logger zerowrap.Logger,
-	load func(key, value []byte, version uint64),
+	load func(key, value []byte, version uint64, m *mapping),
 	apply func(seq uint64, ops []op),
 ) (rec recovered, err error) {
 	dir = filepath.Clean(dir)
@@ -128,7 +131,7 @@ func recoverDir(fx fsys.FS, dir string, logger zerowrap.Logger,
 	slices.Sort(snaps)
 	for i := len(snaps) - 1; i >= 0; i-- {
 		path := filepath.Join(dir, snapshotName(snaps[i]))
-		data, err := readFile(fx, path)
+		data, unmap, err := mapFile(fx, path, logger)
 		if err != nil {
 			return rec, err
 		}
@@ -137,11 +140,20 @@ func recoverDir(fx fsys.FS, dir string, logger zerowrap.Logger,
 			err = fmt.Errorf("%w: snapshot seq %d does not match its name", ErrCorrupt, view.seq)
 		}
 		if err != nil {
+			if unmap != nil {
+				_ = unmap()
+			}
 			logger.Warn().Err(err).Str("file", path).Msg("ignoring invalid snapshot")
 			continue
 		}
 		if load != nil {
-			view.each(load)
+			var m *mapping
+			if unmap != nil {
+				m = newMapping(data, unmap, path)
+			}
+			view.each(func(key, value []byte, version uint64) { load(key, value, version, m) })
+		} else if unmap != nil {
+			_ = unmap()
 		}
 		rec.snapSeq = view.seq
 		break
@@ -280,6 +292,32 @@ func readFile(fx fsys.FS, path string) ([]byte, error) {
 		err = cerr
 	}
 	return data, err
+}
+
+// mapFile maps the file at path read-only. If mapping fails, it logs a warning
+// and reads the file instead; unmap is then nil. The file is closed in both
+// cases: a mapping stays valid until unmap.
+func mapFile(fx fsys.FS, path string, logger zerowrap.Logger) (data []byte, unmap func() error, err error) {
+	f, err := fx.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, unmap, err = f.Map()
+	if err != nil {
+		logger.Warn().Err(err).Str("file", path).Msg("cannot map snapshot, reading it")
+		data, err = readAll(f)
+		unmap = nil
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		if unmap != nil {
+			_ = unmap()
+		}
+		return nil, nil, err
+	}
+	return data, unmap, nil
 }
 
 // readAll returns the whole content of f.

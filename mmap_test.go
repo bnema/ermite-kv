@@ -13,9 +13,9 @@ import (
 	"bnema.dev/ermite-kv/internal/fsys"
 )
 
-// mapFile maps a temp file holding content. unmapped is set when the
+// mapTempFile maps a temp file holding content. unmapped is set when the
 // mapping's unmap function runs.
-func mapFile(t *testing.T, content string) (data []byte, unmap func() error, name string, unmapped *atomic.Bool) {
+func mapTempFile(t *testing.T, content string) (data []byte, unmap func() error, name string, unmapped *atomic.Bool) {
 	t.Helper()
 	name = filepath.Join(t.TempDir(), "snap")
 	if err := os.WriteFile(name, []byte(content), 0o600); err != nil {
@@ -35,7 +35,7 @@ func mapFile(t *testing.T, content string) (data []byte, unmap func() error, nam
 }
 
 func TestMappingReleasedByGC(t *testing.T) {
-	data, unmap, name, unmapped := mapFile(t, "cold value")
+	data, unmap, name, unmapped := mapTempFile(t, "cold value")
 	before := mappingsReleased.Load()
 	m := newMapping(data, unmap, name)
 	if string(m.data) != "cold value" || m.name != name {
@@ -58,7 +58,7 @@ func TestMappingReleasedByGC(t *testing.T) {
 }
 
 func TestMappingKeptWhileReachable(t *testing.T) {
-	data, unmap, name, unmapped := mapFile(t, "hot")
+	data, unmap, name, unmapped := mapTempFile(t, "hot")
 	m := newMapping(data, unmap, name)
 	for range 5 {
 		runtime.GC()
