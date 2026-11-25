@@ -17,6 +17,7 @@
 - Data in memory, persisted to an append-only log with snapshots
 - One writer groups commits into a single `fsync`
 - Lock-free reads from immutable snapshots
+- Large values (1 KiB and up, `Options.ColdValueBytes`) served from the memory-mapped snapshot file instead of the heap
 - Conditional writes (`RequireAbsent`, `RequireVersion`)
 - Standard library only, plus [zerowrap](https://git.bnema.dev/zerowrap) for logs
 
@@ -46,7 +47,14 @@ for key, item := range db.Snapshot(ctx).Prefix(ctx, []byte("user/")) {
 }
 ```
 
-Durability and visibility guarantees are in the package documentation (`go doc bnema.dev/ermite-kv`).
+Durability, visibility and value lifetime guarantees are in the package documentation (`go doc bnema.dev/ermite-kv`).
+
+## Operation
+
+- Only the database writes its directory: never modify, truncate or replace its files while it is open.
+- A disk I/O error while reading a memory-mapped value raises `SIGBUS` and crashes the process.
+- Mapped values live in the page cache: file-backed, reclaimable memory, not heap.
+- `Item.Value` stays valid while you hold the `Item` or its `Snapshot`, and for at least one more compaction; copy values you keep longer.
 
 ## Test
 

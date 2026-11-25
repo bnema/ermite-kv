@@ -9,7 +9,10 @@ import (
 
 // Item is the value stored under a key.
 type Item struct {
-	Value   []byte // owned by the snapshot: must not be modified
+	// Value is owned by the snapshot and must not be modified. It stays
+	// valid while the Item or its Snapshot is held, and for at least one
+	// more compaction after that; copy it to keep it longer.
+	Value   []byte
 	Version uint64 // seq of the batch that last wrote the key
 
 	m *mapping // keeps the snapshot mapping alive while Value aliases it
@@ -34,8 +37,9 @@ func (s *Snapshot) Seq() uint64 { return s.seq }
 // Len returns the number of keys.
 func (s *Snapshot) Len() int { return s.t.len() }
 
-// Get returns the item stored under key. Reads never block or log: ctx is
-// not checked.
+// Get returns the item stored under key. Reads take no lock and do not log:
+// ctx is not checked. Reading a value served from the snapshot file may wait
+// for a page fault (disk I/O).
 func (s *Snapshot) Get(_ context.Context, key []byte) (Item, bool) { return s.t.get(key) }
 
 // Range iterates over the keys in [start, end) in ascending order. A nil end

@@ -18,10 +18,10 @@ var onRelease atomic.Pointer[func(name string)]
 // mapping is a whole snapshot file mapped read-only.
 //
 // It is unmapped by a cleanup once nothing references the *mapping: no entry,
-// Item or pinned generation (see pins: the DB keeps a generation for one
-// more swap so that bare value slices stay valid). Values that alias data are only valid while the
-// *mapping is reachable, so whoever holds such a value must also hold the
-// *mapping.
+// Item or pinned generation (see pins: the DB keeps a generation for one more
+// swap so that bare value slices stay valid). Values that alias data are only
+// valid while the *mapping is reachable, so whoever holds such a value must
+// also hold the *mapping.
 type mapping struct {
 	data []byte
 	name string // snapshot file the data comes from
