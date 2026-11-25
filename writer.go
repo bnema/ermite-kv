@@ -12,15 +12,6 @@ import (
 // larger than this forms a group of one.
 const maxGroupBytes = 4 << 20
 
-// coldChunk is the number of cold candidates the writer repoints between two
-// commit groups.
-const coldChunk = 1024
-
-// coldEvery is the number of commit groups after which pending cold work
-// gets a chunk even if requests are waiting, so that it completes under a
-// constant write load.
-const coldEvery = 16
-
 // request is a batch waiting for the writer. The writer answers on reply
 // exactly once. Requests are allocated per Apply and never pooled: a pooled
 // channel would be shared across testing/synctest bubbles, and receiving on a
@@ -64,7 +55,7 @@ func (db *DB) writer() {
 			db.takeCold(w)
 		default:
 		}
-		if db.cold != nil && db.coldGroups >= coldEvery {
+		if db.cold.job != nil && db.cold.groups >= coldEvery {
 			db.applyColdChunk()
 			continue
 		}
@@ -86,122 +77,11 @@ func (db *DB) writer() {
 		if !db.commit() {
 			return
 		}
-		db.coldGroups++
+		db.cold.groups++
 		if !db.maybeCompact() {
 			return
 		}
 	}
-}
-
-// next waits for the next request. Without cold work it blocks; with cold
-// work pending it applies one chunk when no request is ready. It returns a
-// nil request when it handled cold work instead, and false on close.
-func (db *DB) next() (*request, bool) {
-	if db.cold == nil {
-		select {
-		case <-db.closing:
-			return nil, false
-		case r := <-db.reqCh:
-			return r, true
-		case w := <-db.coldCh:
-			db.takeCold(w)
-			return nil, true
-		}
-	}
-	select {
-	case <-db.closing:
-		return nil, false
-	case r := <-db.reqCh:
-		return r, true
-	case w := <-db.coldCh:
-		db.takeCold(w)
-		return nil, true
-	default:
-		db.applyColdChunk()
-		return nil, true
-	}
-}
-
-// takeCold makes w the pending cold job. It replaces a pending job, whose
-// mapping stays pinned if the tree already references it.
-func (db *DB) takeCold(w *coldWork) {
-	if db.cold != nil && db.coldPublished {
-		db.pins.superseded(db.cold.m)
-	}
-	db.cold, db.coldNext, db.coldPublished, db.coldGroups = w, 0, false, 0
-}
-
-// applyColdChunk repoints up to coldChunk candidates of db.cold to the
-// mapping and publishes the result with the same seq: readers see the same
-// bytes. A candidate whose key was rewritten or deleted since the snapshot
-// no longer matches its version and is skipped. It runs on the writer
-// between commit groups. A job without candidates (m nil) completes at once.
-func (db *DB) applyColdChunk() {
-	w := db.cold
-	end := min(db.coldNext+coldChunk, len(w.cands))
-	cur := db.snap.Load()
-	bld := cur.t.builder()
-	changed := false
-	for _, c := range w.cands[db.coldNext:end] {
-		if bld.setValue(c.key, c.version, c.value, w.m) {
-			changed = true
-		}
-	}
-	if changed {
-		db.snap.Store(newSnapshot(bld.freeze(), cur.seq))
-		db.coldPublished = true
-	}
-	db.coldNext, db.coldGroups = end, 0
-	db.coldChunks.Add(1)
-	if end == len(w.cands) {
-		db.coldSwapped()
-	}
-}
-
-// coldSwapped ends the cold job: every candidate has been repointed and its
-// mapping (nil for a job without candidates) becomes the current generation.
-func (db *DB) coldSwapped() {
-	db.pins.swapped(db.cold.m)
-	db.cold, db.coldNext, db.coldPublished = nil, 0, false
-	db.coldJobs.Add(1)
-}
-
-// pins keeps snapshot mappings alive after the tree stops referencing them.
-//
-// A reader may keep a bare value slice (item.Value) without the Item or the
-// Snapshot, and Go does not keep the Item alive for it: such a value is only
-// protected by the references the published trees hold to its mapping. So
-// a mapping referenced by a published snapshot stays pinned until one full
-// swap has completed after it stopped being the current generation:
-//   - gen is the current generation: the mapping Open kept values in, then
-//     the mapping of each completed swap;
-//   - partial holds the mappings of superseded cold jobs that had already
-//     published a chunk, since the tree references them;
-//   - pinned holds the previous generation and the partial mappings it was
-//     swapped out with. The next completed swap releases them.
-//
-// Owned by the writer goroutine. The pins stay after the writer exits (Close
-// or failure) and live as long as the DB is reachable, since no swap can
-// release them anymore.
-type pins struct {
-	gen     *mapping
-	partial []*mapping
-	pinned  []*mapping
-}
-
-// superseded records that the job of m was replaced after publishing a chunk.
-func (p *pins) superseded(m *mapping) { p.partial = append(p.partial, m) }
-
-// swapped makes m the current generation once its swap is complete: the
-// previous generation and the partial mappings stay pinned until the next
-// swap, anything pinned before is released.
-func (p *pins) swapped(m *mapping) {
-	p.pinned = nil // a [:0:0] slice would still hold the old backing array
-	if p.gen != nil {
-		p.pinned = append(p.pinned, p.gen)
-	}
-	p.pinned = append(p.pinned, p.partial...)
-	p.gen, p.partial = m, nil
 }
 
 // collect fills db.group starting with first: it drains the queued requests

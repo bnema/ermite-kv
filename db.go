@@ -104,15 +104,10 @@ type DB struct {
 	buf     []byte // group encoding buffer
 	group   []*request
 
-	// Owned by the writer goroutine: the cold job being applied and the
-	// index of its next candidate.
-	cold          *coldWork
-	coldNext      int
-	coldGroups    int  // commit groups since the last cold chunk
-	coldPublished bool // a chunk of cold was published: the tree references cold.m
-	pins          pins
+	cold coldState // owned by the writer goroutine
 
-	// Test hooks: cold chunks applied and cold jobs completed.
+	// Test observability only: cold chunks applied and cold jobs completed.
+	// Tests wait on them; nothing else reads them.
 	coldChunks, coldJobs atomic.Int64
 }
 
@@ -179,7 +174,7 @@ func open(ctx context.Context, fx fsys.FS, dir string, opts Options) (*DB, error
 		file:    rec.log,
 		logBase: rec.logBase,
 		logSize: rec.logSize,
-		pins:    pins{gen: gen},
+		cold:    coldState{pins: pins{gen: gen}},
 	}
 	t := bld.freeze()
 	db.snap.Store(newSnapshot(t, rec.lastSeq))
